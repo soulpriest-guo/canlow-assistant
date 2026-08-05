@@ -622,7 +622,6 @@ pub struct ContextProfile {
     pub max_chars: usize,
     pub user_budget_chars: usize,
     pub keep_recent_chars: usize,
-    pub budget_chars: usize,
     pub budget_tokens: usize,
 }
 
@@ -637,14 +636,12 @@ pub fn context_profile(db: &Db) -> ContextProfile {
             max_chars: 600_000,        // 约 200k tokens（256k 窗口留足输出空间）
             user_budget_chars: 60_000, // 约 2 万 tokens 用户消息
             keep_recent_chars: 150_000, // 约 5 万 tokens 最近消息（覆盖 4-5 轮工作）
-            budget_chars: 520_000,     // 85% 预算提醒
             budget_tokens: 200_000,
         },
         _ => ContextProfile {
             max_chars: 2_400_000,      // 约 800k tokens（1M 窗口，最大化缓存利用）
             user_budget_chars: 120_000, // 约 4 万 tokens 用户消息
             keep_recent_chars: 400_000, // 约 13 万 tokens 最近消息（覆盖 4-5 轮工作）
-            budget_chars: 2_100_000,   // 85% 预算提醒
             budget_tokens: 800_000,
         },
     }
@@ -933,25 +930,9 @@ pub async fn run_agent_turn(
         });
         api_messages.extend(history.iter().cloned());
 
-        // 预算提醒：上下文使用接近预算时注入收敛指令（Codex token_budget 机制）
-        let used_chars: usize = api_messages
-            .iter()
-            .map(|m| m.content.len() + m.reasoning_content.as_deref().unwrap_or("").len())
-            .sum();
-        let profile = context_profile(db);
-        if used_chars > profile.budget_chars * 85 / 100 {
-            // ★ 预算提醒改为末尾注入（去重），绝不修改 system 第一条（否则 system 变化导致全量缓存失效）
-            let budget_marker = "【上下文预算提醒】";
-            api_messages.retain(|m| !(m.role == "user" && m.content.starts_with(budget_marker)));
-            push_tail_message(&mut api_messages, ChatMessage {
-                role: "user".into(),
-                content: format!("{budget_marker}（系统注入，非用户消息）上下文使用已接近预算上限，请立即基于已有信息给出最终总结，不要再调用任何工具或读取新文件。"),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
-        }
+        // ★ 不再注入「接近预算请立即总结」类提醒：上下文超限由
+        //   compact_history_if_needed 在上方自动压缩（保留用户消息原文 + 交接摘要），
+        //   避免打断 AI 在大工程中的正常执行（压缩时不会让 AI 停止调用工具）。
 
         // 修复历史中可能存在的残缺工具消息序列（补丁同时写回 DB，持久修复）
         let seq_patches = fix_tool_sequence(&mut api_messages);
