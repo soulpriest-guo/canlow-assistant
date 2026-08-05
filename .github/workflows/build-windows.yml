@@ -1,0 +1,23 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:        # GitHub Actions 页手动触发
+  push:
+    tags: ['v*']            # 推送 v1.0.0 等标签自动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - run: npm install
+      - run: npm run tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canlow-windows
+          path: src-tauri/target/release/bundle/**
