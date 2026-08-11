@@ -118,6 +118,9 @@ pub struct CacheStats {
 /// 避免多会话并发时互相干扰）
 pub struct AgentSession {
     pub stop_flag: AtomicBool,
+    /// 会话循环是否正在运行（并发防护：stop 后立即 resume/send 可能启动双循环，
+    /// 导致消息顺序错乱——孤立 tool / HTTP 400 的来源之一）
+    pub running: AtomicBool,
     pub pending_permissions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// 计划确认等待：AI 修改任务图结构后暂停循环，等待用户同意/拒绝
     /// （所有创建/更改任务都必须用户确认才继续执行；一次只允许一个等待）
@@ -129,6 +132,7 @@ impl Default for AgentSession {
     fn default() -> Self {
         Self {
             stop_flag: AtomicBool::new(false),
+            running: AtomicBool::new(false),
             pending_permissions: Mutex::new(HashMap::new()),
             pending_plan_confirm: Mutex::new(None),
             cache_stats: Mutex::new(CacheStats::default()),
@@ -821,6 +825,50 @@ fn fix_tool_sequence(msgs: &mut Vec<ChatMessage>) -> Vec<ChatMessage> {
     patches
 }
 
+/// 发送前最终消毒：移除孤立 tool 消息（其前没有带对应 tool_calls 的 assistant，
+/// 或中间隔着 user/system 等会打断配对的角色）。历史残缺、补丁错位、并发竞争的
+/// 最终防线——防止 API 400（Messages with role 'tool' must be a response to a
+/// preceding message with 'tool_calls'）。
+fn sanitize_orphan_tools(msgs: &mut Vec<ChatMessage>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    let mut open_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while i < msgs.len() {
+        match msgs[i].role.as_str() {
+            "assistant" => {
+                // assistant 打开新的 tool_call 配对集合；无 tool_calls 的 assistant
+                // 会清空集合（其后的 tool 均视为孤立）
+                open_ids.clear();
+                if let Some(tcs) = &msgs[i].tool_calls {
+                    for tc in tcs {
+                        open_ids.insert(tc.id.clone());
+                    }
+                }
+                i += 1;
+            }
+            "tool" => {
+                let valid = match &msgs[i].tool_call_id {
+                    Some(id) => open_ids.contains(id),
+                    None => false,
+                };
+                if valid {
+                    i += 1;
+                } else {
+                    msgs.remove(i);
+                    changed = true;
+                }
+            }
+            _ => {
+                // user/system 会打断 tool 与前置 assistant 的配对（API 要求 tool
+                // 紧跟所属 assistant 之后）；其后的 tool 不再属于前面的 assistant
+                open_ids.clear();
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
 /// 安全追加 system 消息：若末尾是 tool（不能直接跟 system），先补空 assistant 占位
 fn push_tail_message(msgs: &mut Vec<ChatMessage>, msg: ChatMessage) {
     if msgs.last().map(|m| m.role == "tool").unwrap_or(false) {
@@ -896,6 +944,30 @@ pub async fn run_agent_turn(
             .or_insert_with(|| Arc::new(AgentSession::default()))
             .clone()
     };
+    // ★ 并发防护：同一会话不允许两个循环同时运行（stop 后立即 resume/send 可能
+    //   启动双循环，导致消息顺序错乱——孤立 tool / HTTP 400 的另一个来源）。
+    //   等待旧循环退出（stop 后通常在数百 ms 内退出），超时则拒绝。
+    let mut waited_ms = 0u64;
+    while session.running.load(Ordering::Acquire) {
+        if waited_ms >= 3000 {
+            return Err("该会话仍在执行中，请稍后再试".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        waited_ms += 100;
+    }
+    if session.running.swap(true, Ordering::AcqRel) {
+        return Err("该会话仍在执行中，请稍后再试".into());
+    }
+    // RAII guard：所有退出路径（return / break / panic unwind）都会恢复 running=false
+    struct RunningGuard<'a> {
+        session: &'a AgentSession,
+    }
+    impl Drop for RunningGuard<'_> {
+        fn drop(&mut self) {
+            self.session.running.store(false, Ordering::Release);
+        }
+    }
+    let _guard = RunningGuard { session: &session };
     session.stop_flag.store(false, Ordering::Relaxed);
     if let Some(text) = &user_input {
         db.append_messages(&conv_id, &[ChatMessage::user(text)])?;
@@ -934,10 +1006,16 @@ pub async fn run_agent_turn(
         //   compact_history_if_needed 在上方自动压缩（保留用户消息原文 + 交接摘要），
         //   避免打断 AI 在大工程中的正常执行（压缩时不会让 AI 停止调用工具）。
 
-        // 修复历史中可能存在的残缺工具消息序列（补丁同时写回 DB，持久修复）
+        // 修复历史中可能存在的残缺工具消息序列。
+        // ★ 持久化方式：把修复后的完整历史写回 DB（而非把补丁 append 到末尾）——
+        //   补丁若追加到消息末尾会与其所属 assistant 错位，下次加载时出现孤立 tool，
+        //   触发 API 400（Messages with role 'tool' must be a response to a preceding
+        //   message with 'tool_calls'），且错位补丁会持续累积。
         let seq_patches = fix_tool_sequence(&mut api_messages);
         if !seq_patches.is_empty() {
-            let _ = db.append_messages(&conv_id, &seq_patches);
+            // api_messages = [system, ...history]；写回时去掉 system（每轮由 build_system_prompt 重建）
+            let fixed_history: Vec<ChatMessage> = api_messages.iter().skip(1).cloned().collect();
+            let _ = db.replace_messages(&conv_id, &fixed_history);
         }
 
         // ★ 空消息防护：带 tool_calls 的空 assistant 给中性占位（避免模型把空消息当作用户输入）
@@ -1065,6 +1143,10 @@ pub async fn run_agent_turn(
         } else {
             all_tools
         };
+
+        // ★ 发送前最终消毒：兜底移除孤立 tool 消息（历史残缺/补丁错位/并发竞争的
+        //   最终防线），确保发送给 API 的消息序列严格合法
+        sanitize_orphan_tools(&mut api_messages);
 
         // 2) 流式请求
         let (content, reasoning, tool_calls, usage) = match stream_request(
@@ -1460,6 +1542,159 @@ mod tests {
         assert_eq!(msgs[3].role, "assistant");
         assert_eq!(msgs[3].tool_calls, None);
         assert_eq!(msgs[4].role, "user");
+    }
+
+    #[test]
+    fn sanitize_removes_orphan_tools() {
+        // 末尾孤立 tool（前是 user，无 assistant 声明 tool_calls）→ 移除
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::tool_result("call_1", "list_dir", "ok"),
+        ];
+        assert!(sanitize_orphan_tools(&mut msgs));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+
+        // assistant 不带 tool_calls 后跟 tool → 孤立，移除
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("普通回复"),
+            ChatMessage::tool_result("call_1", "list_dir", "ok"),
+        ];
+        assert!(sanitize_orphan_tools(&mut msgs));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "assistant");
+
+        // tool_call_id 与前置 assistant 不匹配 → 移除
+        let tc = ToolCall {
+            id: "call_a".into(),
+            call_type: "function".into(),
+            function: super::super::types::ToolCallFunction {
+                name: "list_dir".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: Some(vec![tc]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::tool_result("call_b", "list_dir", "ok"),
+        ];
+        assert!(sanitize_orphan_tools(&mut msgs));
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_sequence() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: super::super::types::ToolCallFunction {
+                name: "list_dir".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: Some(vec![tc]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::tool_result("call_1", "list_dir", "ok"),
+            ChatMessage::assistant("完成"),
+        ];
+        assert!(!sanitize_orphan_tools(&mut msgs));
+        assert_eq!(msgs.len(), 4);
+    }
+
+    #[test]
+    fn sanitize_removes_tool_after_user_gap() {
+        // [assistant(tc), tool, user, tool]：第二个 tool 前隔着 user → 配对被打断 → 移除
+        let tc = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: super::super::types::ToolCallFunction {
+                name: "list_dir".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: Some(vec![tc]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::tool_result("call_1", "list_dir", "ok"),
+            ChatMessage::user("继续"),
+            ChatMessage::tool_result("call_1", "list_dir", "ok"),
+        ];
+        assert!(sanitize_orphan_tools(&mut msgs));
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3].role, "user");
+    }
+
+    #[test]
+    fn fix_and_sanitize_repairs_polluted_history() {
+        // 模拟旧版本留下的污染数据：[user, assistant(tc), user, tool错位(补丁被追加到末尾)]
+        // fix + sanitize 组合后应得到完全合法的序列
+        let tc = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: super::super::types::ToolCallFunction {
+                name: "list_dir".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut msgs = vec![
+            ChatMessage::user("hi"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: Some(vec![tc]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::user("继续"),
+            ChatMessage::tool_result("call_1", "list_dir", "错位占位"),
+        ];
+        let _ = fix_tool_sequence(&mut msgs);
+        let _ = sanitize_orphan_tools(&mut msgs);
+        // 期望：[user, assistant(tc), tool(补), assistant占位, user]
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[1].role, "assistant");
+        assert!(msgs[1].tool_calls.is_some());
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[3].role, "assistant");
+        assert_eq!(msgs[3].tool_calls, None);
+        assert_eq!(msgs[4].role, "user");
+        // 序列合法性：每个 tool 都能回溯到带对应 tool_calls 的 assistant
+        let mut last_asst_tc: Option<Vec<String>> = None;
+        for m in &msgs {
+            if m.role == "assistant" {
+                last_asst_tc = m.tool_calls.as_ref().map(|tcs| tcs.iter().map(|t| t.id.clone()).collect());
+            } else if m.role == "tool" {
+                let ids = last_asst_tc.as_ref().expect("tool 前必须有带 tool_calls 的 assistant");
+                assert!(
+                    ids.iter().any(|id| Some(id.as_str()) == m.tool_call_id.as_deref()),
+                    "tool_call_id 必须属于前置 assistant"
+                );
+            }
+        }
     }
 }
 
