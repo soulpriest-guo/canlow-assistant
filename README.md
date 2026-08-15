@@ -82,6 +82,75 @@ canlow-next/
 
 Rust 侧（`api_stream`）不做任何消息改写，只负责流式转发和透传 usage（含 `prompt_cache_hit_tokens`），为缓存命中率统计留好接口。
 
+## DeepSeek 请求纪律（全局默认行为）
+
+模仿 DeepSeek Harness（DSH）的 `llm-deepseek` 适配器与请求纪律，在**请求线上**复刻其加速与缓存命中技术。这些行为对所有会话、所有提供商**无条件生效**（无需开关）：
+
+| 技术 | DSH 出处 | Canlow 实现 |
+|---|---|---|
+| `stream_options.include_usage` | 流式请求始终开启，usage 随 [DONE] 前到达 | 所有请求写入 payload，保证拿到 `prompt_cache_hit_tokens` |
+| reasoning 回传规则（按提供商自动） | 官方 thinking 模式 passback 规则：带 tool_calls 的 assistant 必须回传 `reasoning_content`；纯文本轮次被忽略，丢弃省 token | `supports_thinking=true` 的提供商（DeepSeek/智谱/小米）：仅在工具轮回传（空则空字符串占位防 400），纯文本轮丢弃；不支持的提供商（OpenAI/Kimi 等）永不发送该字段 |
+| 空工具输出占位 | 空 tool 结果以 `(no output)` 过线 | 空工具输出统一序列化为 `(no output)` |
+| 有界指数退避重试 | 默认 initialDelay 500ms / maxDelay 10s / jitter 0.1，尊重 Retry-After | 网络错误 / HTTP 429 / 5xx 重试 ≤3 次，指数退避 + 抖动，429 优先尊重 Retry-After |
+| 缓存命中统计 | 会话事件里透传 `cacheReadTokens` | 每轮累计 hit/miss → `cache-stats` 事件 → 会话栏「⚡ 缓存 xx%（命中 tokens）」实时显示 |
+
+此前缀纪律（固定 system、历史纯追加、任务图评审从 system 移出、延迟压缩）同为全局行为。
+
+## 省 token 机制（借鉴 DSH 的上下文纪律）
+
+在请求纪律之外，Canlow 还移植了 DSH 的三项上下文省 token 机制（Rust 侧全局生效）：
+
+| 机制 | DSH 出处 | Canlow 实现 |
+|---|---|---|
+| **工具结果落盘** | spill-policy：超大输出存文件，历史只留 头+尾预览 + 定位符 | 结果 >3 万字符自动存入缓存表（`retrieve_cache_entry` 可取回、`search_conversation_history` 可搜索），历史只留 3k 头 + 1k 尾 + 取回提示；`read_file` 单次上限从 50 万降到 8 万字符 |
+| **压缩前结果修剪** | compaction-tool-result-pruner：>8192 字符的工具结果改写为 head 4096 + 标记 + tail 1024 | 触发压缩时对历史里的超大工具结果做同样的 head/tail 修剪（原文入缓存），无模型调用 |
+| **LLM 压缩摘要** | compaction-basic：摘要调用重放对话前缀复用 KV 缓存 | 压缩时优先用当前提供商/模型生成 300 字内交接摘要（DeepSeek 关思考省 token），失败自动回退本地规则摘要；1M 档压缩阈值从 2.4M 下调到 1.8M 字符，更早压缩 |
+
+这三项 + 适配模式的效果：中期多轮任务里，大工具结果不再每轮重复付费，plan_* 工具 schema 每轮固定成本降低（描述精简、重复规则只在 system prompt 里出现一次）。
+
+## 联网搜索优化
+
+- **结果缓存**：同会话同关键词 30 分钟内直接返回缓存（0 延迟、0 token），重复搜索不再触发原生搜索 LLM 调用或抓取
+- **抓取降级并行化**：Bing / DuckDuckGo / 百度三引擎同时请求，第一个成功即返回（原串行最坏 45s+ → 最坏 ~15s）
+- **输出压缩**：搜索结果上限从 12,000 字符降到 5,000（默认 5 条 × 标题+链接+200 字摘要 ≈ 2.5k 字符），原生搜索回答 token 预算 800→400，避免大结果在历史里每轮重复付费
+- **fetch_webpage 提速 + Markdown 化**：超时 25s→15s，>8MB 页面直接拒绝；正文从纯文本升级为 **HTML→Markdown 转换**（零依赖手写转换器，保留链接/列表/代码块/表格/标题结构，对齐 DSH 的 turndown 方案）
+- **结果日期 + 引用纪律**：抓取结果尽力提取发布日期（如 `2024-05-12`）展示在标题旁；搜索结果末尾固定提醒「请以 Markdown 链接格式引用来源 URL」（对齐 DSH 的 cite-your-sources 规则）
+
+## 技能（Skill）与子代理（Subagent）
+
+### 技能
+
+- **技能文件**：项目 `<工作区>/.canlow/skills/<名称>/SKILL.md`（或 `<名称>.md`），也支持用户级 `~/.canlow/skills/`；文件头用 `---` 标注 `name` / `description`，正文即技能指令
+- **可用技能目录**自动注入 system 提示（项目优先、去重），模型随时知道有哪些技能
+- **`skill` 工具**：传 `name` 加载技能完整内容（上限 3 万字符，超出自动落盘）；省略 `name` 返回技能列表
+
+### 子代理
+
+| 工具 | 作用 |
+|---|---|
+| `subagent(description, prompt, run_in_background?)` | 委派自包含任务：独立上下文、共享工作区、看不到主对话历史；默认前台等待最终总结，`run_in_background: true` 后台运行 |
+| `subagent_report(subagent_id)` | 获取子代理结果（运行中返回状态与轮数） |
+| `list_agents` | 列出全部子代理及状态 |
+| `interrupt_agent(agent_id)` | 中断运行中的子代理 |
+| `skill(name)` | 加载技能内容（省略 name 返回列表） |
+
+实现要点：
+- 子代理继承主会话的**提供商/模型/工作区/授权策略**；权限弹窗路由到主会话 UI（描述带「子代理请求」前缀），停止主会话会连带停止其派生的子代理
+- 子代理对话**只存内存**（不进主会话历史、不落库），主代理只看到最终总结；40 轮上限防失控，历史超限自动裁剪
+- 子代理可以**递归委派**（孙代理），权限与通知同样路由到根会话
+- 后台子代理跑在独立线程的 current-thread runtime 上（`block_on`），避免互相递归 async fn 的 future 类型无限嵌套问题
+
+## 会话日志导出（Session Log Export）
+
+对齐 DSH 的 `session-log-export`：会话工具栏「导出」按钮（下载图标）把**当前会话的完整事件日志**保存到本地文件。零 token 成本（纯本地读取，不经过模型）。
+
+| 格式 | 内容 | 用途 |
+|---|---|---|
+| **JSONL**（默认，`.jsonl`） | 一行一条事件：`session` 头（元数据/提供商/模型）+ 每条消息的 `seq`/`role`/`content`/`reasoningContent`/`toolCalls`/`toolCallId`/`createdAt` + `taskmap`（如有任务图） | 完整事件日志：调试、审计（缓存/工具调用/消息序列）、机器可读存档、回放分析 |
+| **Markdown**（`.md`） | 人类可读转写：用户/助手（含推理引用）/工具调用与结果，末尾附任务图 JSON | 阅读、分享、归档 |
+
+保存路径由系统保存对话框选择（前端 `save()` → 后端写入），文件后缀 `.md` 自动切 Markdown，其余导出 JSONL。
+
 ## 任务图层级语义（工程模式）
 
 ```

@@ -472,7 +472,9 @@ body {
 .session-bar {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 16px; border-bottom: 1px solid var(--border);
-  background: var(--bg-panel); font-size: 12.5px; flex-wrap: wrap;
+  background: var(--bg-panel); font-size: 12.5px;
+  /* ★ 单行：目录地址缩短省略，缓存命中率保持在行尾，不换行到第二行 */
+  flex-wrap: nowrap; overflow: hidden;
 }
 .sb-item {
   display: inline-flex; align-items: center; gap: 6px;
@@ -485,14 +487,48 @@ body {
 .sb-item input:focus, .sb-item select:focus { border-color: var(--accent); }
 .sb-dir {
   background: none; border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text-dim); padding: 4px 9px; cursor: pointer; max-width: 320px;
+  color: var(--text-dim); padding: 4px 9px; cursor: pointer;
+  /* ★ 缩短工作目录地址显示（完整路径 hover 查看） */
+  max-width: 240px; flex-shrink: 1; min-width: 0;
 }
 .sb-dir:hover { color: var(--text); border-color: var(--accent); }
 .sb-dir-text {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 190px;
 }
 .dir-input-row { display: flex; gap: 6px; }
 .dir-input-row input { flex: 1; }
+
+/* ---------- 技能管理 ---------- */
+.skills-toolbar { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.skills-list { display: flex; flex-direction: column; gap: 6px; margin: 10px 0; }
+.skill-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px;
+}
+.skill-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.skill-item-name {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-weight: 600; color: var(--text); font-size: 13px;
+}
+.skill-item-name svg { color: #ffd479; }
+.skill-item-desc { color: var(--text-dim); font-size: 12px; }
+.skill-item-path {
+  color: var(--text-dim); font-size: 11px; opacity: 0.7;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px;
+}
+.skill-item-use { flex-shrink: 0; }
+.skill-create {
+  margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.skill-content-input {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px; font-size: 12.5px; font-family: inherit; outline: none;
+}
+.skill-content-input:focus { border-color: var(--accent); }
 
 /* ---------- 提供商管理 ---------- */
 .providers-modal { width: 640px; }
@@ -520,7 +556,7 @@ body {
 .add-custom { margin-top: 10px; }
 .custom-form { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
 
-.sb-cache { color: #ffd479; font-variant-numeric: tabular-nums; }
+.sb-cache { color: #ffd479; font-variant-numeric: tabular-nums; margin-left: auto; white-space: nowrap; }
 .sb-cache.good { color: #35d07f; }
 
 .auth-mode-select {

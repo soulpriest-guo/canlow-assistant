@@ -65,6 +65,8 @@ export default function App() {
             conv={activeConv}
             providers={chat.providers}
             cacheRate={chat.cacheStats.rate}
+            cacheHit={chat.cacheStats.hit}
+            cacheMiss={chat.cacheStats.miss}
             engineeringMode={activeConv?.engineeringMode ?? false}
             onToggleEngineering={async (v) => {
               if (!chat.activeId) return;
@@ -110,6 +112,11 @@ export default function App() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onProvidersChanged={chat.refreshProviders}
+        workDir={activeConv?.workDir ?? ""}
+        onUseSkill={(name) => {
+          // 应用技能：向当前对话发送使用指令（AI 会用 skill 工具加载并遵循）
+          chat.sendText(`请使用技能「${name}」：先用 skill 工具加载它的完整内容，然后严格遵循其中的指令，并简要说明你已就绪。`);
+        }}
       />
       <PermissionModal req={chat.permission} onAnswer={chat.answerPermission} />
 

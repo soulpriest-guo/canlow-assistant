@@ -27,6 +27,7 @@ impl Db {
                 provider TEXT NOT NULL DEFAULT 'DeepSeek',
                 model TEXT NOT NULL DEFAULT '',
                 engineering_mode INTEGER NOT NULL DEFAULT 0,
+                deepseek_mode INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -92,6 +93,21 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         }
+        // 迁移：为旧库添加 deepseek_mode 列（DeepSeek 适配模式，默认开启）
+        let has_deepseek_mode: bool = conn
+            .prepare("PRAGMA table_info(conversations)")
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "deepseek_mode");
+        if !has_deepseek_mode {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN deepseek_mode INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -111,14 +127,15 @@ impl Db {
         provider: &str,
         model: &str,
         reasoning_effort: &str,
+        deepseek_mode: bool,
     ) -> Result<ConversationMeta, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Self::now();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, title, work_dir, provider, model, reasoning_effort, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![id, title, work_dir, provider, model, reasoning_effort, now],
+            "INSERT INTO conversations (id, title, work_dir, provider, model, reasoning_effort, deepseek_mode, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![id, title, work_dir, provider, model, reasoning_effort, deepseek_mode as i64, now],
         )
         .map_err(|e| e.to_string())?;
         Ok(ConversationMeta {
@@ -129,6 +146,7 @@ impl Db {
             model: model.to_string(),
             reasoning_effort: reasoning_effort.to_string(),
             engineering_mode: false,
+            deepseek_mode,
             created_at: now,
             updated_at: now,
         })
@@ -138,7 +156,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, work_dir, provider, model, reasoning_effort, engineering_mode, created_at, updated_at
+                "SELECT id, title, work_dir, provider, model, reasoning_effort, engineering_mode, deepseek_mode, created_at, updated_at
                  FROM conversations ORDER BY updated_at DESC",
             )
             .map_err(|e| e.to_string())?;
@@ -152,8 +170,9 @@ impl Db {
                     model: r.get(4)?,
                     reasoning_effort: r.get(5)?,
                     engineering_mode: r.get::<_, i64>(6)? != 0,
-                    created_at: r.get(7)?,
-                    updated_at: r.get(8)?,
+                    deepseek_mode: r.get::<_, i64>(7)? != 0,
+                    created_at: r.get(8)?,
+                    updated_at: r.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -168,7 +187,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT id, title, work_dir, provider, model, reasoning_effort, engineering_mode, created_at, updated_at
+                "SELECT id, title, work_dir, provider, model, reasoning_effort, engineering_mode, deepseek_mode, created_at, updated_at
                  FROM conversations WHERE id = ?1",
                 params![id],
                 |r| {
@@ -180,8 +199,9 @@ impl Db {
                         model: r.get(4)?,
                         reasoning_effort: r.get(5)?,
                         engineering_mode: r.get::<_, i64>(6)? != 0,
-                        created_at: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        deepseek_mode: r.get::<_, i64>(7)? != 0,
+                        created_at: r.get(8)?,
+                        updated_at: r.get(9)?,
                     })
                 },
             )
@@ -285,6 +305,44 @@ impl Db {
         Ok(out)
     }
 
+    /// 导出用：消息带 seq 与创建时间（完整事件日志语义，供 session_export 使用）
+    pub fn load_messages_export(
+        &self,
+        conv_id: &str,
+    ) -> Result<Vec<(i64, ChatMessage, i64)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, role, content, reasoning_content, tool_calls, tool_call_id, name, created_at
+                 FROM messages WHERE conv_id = ?1 ORDER BY seq",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![conv_id], |r| {
+                let tool_calls_json: Option<String> = r.get(4)?;
+                let tool_calls = tool_calls_json
+                    .and_then(|j| serde_json::from_str::<Vec<ToolCall>>(&j).ok());
+                Ok((
+                    r.get(0)?,
+                    ChatMessage {
+                        role: r.get(1)?,
+                        content: r.get(2)?,
+                        reasoning_content: r.get(3)?,
+                        tool_calls,
+                        tool_call_id: r.get(5)?,
+                        name: r.get(6)?,
+                    },
+                    r.get(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
     pub fn taskmap_load(&self, conv_id: &str) -> Result<Option<String>, String> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -378,6 +436,28 @@ impl Db {
                 "SELECT summary, data FROM cache_entries WHERE id = ?1",
                 params![entry_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(row)
+    }
+
+    /// 按 summary 精确查找缓存条目（web 搜索缓存用；max_age_ms 内有效）
+    pub fn cache_find_by_summary(
+        &self,
+        conv_id: &str,
+        summary: &str,
+        max_age_ms: i64,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = Self::now() - max_age_ms;
+        let row = conn
+            .query_row(
+                "SELECT data FROM cache_entries
+                 WHERE conv_id = ?1 AND summary = ?2 AND created_at >= ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![conv_id, summary, cutoff],
+                |r| r.get::<_, String>(0),
             )
             .optional()
             .map_err(|e| e.to_string())?;
@@ -588,7 +668,7 @@ mod tests {
     #[test]
     fn session_crud() {
         let (db, _d) = test_db();
-        let c = db.create_conversation("测试", "/tmp", "DeepSeek", "deepseek-v4-flash", "high").unwrap();
+        let c = db.create_conversation("测试", "/tmp", "DeepSeek", "deepseek-v4-flash", "high", true).unwrap();
         assert_eq!(c.title, "测试");
         let list = db.list_conversations().unwrap();
         assert_eq!(list.len(), 1);
@@ -605,7 +685,7 @@ mod tests {
     #[test]
     fn append_order() {
         let (db, _d) = test_db();
-        let c = db.create_conversation("t", "", "", "", "high").unwrap();
+        let c = db.create_conversation("t", "", "", "", "high", true).unwrap();
         db.append_messages(&c.id, &[ChatMessage::user("a"), ChatMessage::user("b")]).unwrap();
         db.append_messages(&c.id, &[ChatMessage::user("c")]).unwrap();
         let msgs = db.load_messages(&c.id).unwrap();

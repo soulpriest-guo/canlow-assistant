@@ -15,15 +15,21 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            // ★ CANLOW_DATA_DIR 环境变量可覆盖数据目录（便携模式/受限环境测试用）；
+            //   缺省用系统应用数据目录
+            let data_dir = std::env::var("CANLOW_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    app.path()
+                        .app_data_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
             std::fs::create_dir_all(&data_dir).ok();
-            let db = Db::open(&data_dir).expect("初始化数据库失败");
-            app.manage(db);
+            let db = Arc::new(Db::open(&data_dir).expect("初始化数据库失败"));
+            // ★ Arc<Db>：后台子代理任务需要持有数据库句柄（Arc 可克隆）
+            app.manage(db.clone());
             app.manage(Arc::new(CmdRegistry::default()));
-            app.manage(Arc::new(AgentState::default()));
+            app.manage(Arc::new(AgentState::new(db)));
             app.manage(Arc::new(TaskMapStore::default()));
             Ok(())
         })
@@ -34,6 +40,7 @@ pub fn run() {
             commands::session_rename,
             commands::session_update,
             commands::session_messages,
+            commands::session_export,
             commands::agent_turn,
             commands::agent_resume,
             commands::providers_list,
@@ -45,6 +52,9 @@ pub fn run() {
             commands::custom_provider_remove,
             commands::context_profile_get,
             commands::context_profile_set,
+            commands::skills_list,
+            commands::skill_create,
+            commands::skill_open_dir,
             commands::taskmap_get,
             commands::taskmap_save,
             commands::taskmap_delete,

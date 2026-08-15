@@ -1,8 +1,8 @@
-// 会话工具栏：工作目录 / 模型 / 思考强度（会话级可调）
+// 会话工具栏：工作目录 / 模型 / 思考强度 / 会话日志导出（会话级）
 import { useRef, useState } from "react";
-import { FolderOpen } from "lucide-react";
+import { Download, FolderOpen } from "lucide-react";
 import type { ConversationMeta, ProviderDef } from "../types";
-import { pickDirectory } from "../lib/api";
+import { pickDirectory, sessionExport } from "../lib/api";
 
 const EFFORTS = ["low", "high", "max"];
 
@@ -10,12 +10,14 @@ interface Props {
   conv: ConversationMeta | null;
   providers: ProviderDef[];
   cacheRate: number;
+  cacheHit: number;
+  cacheMiss: number;
   engineeringMode: boolean;
   onToggleEngineering: (v: boolean) => void;
   onChange: (patch: { provider?: string; model?: string; reasoningEffort?: string; workDir?: string }) => Promise<void>;
 }
 
-export default function SessionBar({ conv, providers, cacheRate, engineeringMode, onToggleEngineering, onChange }: Props) {
+export default function SessionBar({ conv, providers, cacheRate, cacheHit, cacheMiss, engineeringMode, onToggleEngineering, onChange }: Props) {
   const [editingDir, setEditingDir] = useState(false);
   const [dirInput, setDirInput] = useState("");
   const composingRef = useRef(false);
@@ -30,7 +32,7 @@ export default function SessionBar({ conv, providers, cacheRate, engineeringMode
     <div className="session-bar">
       <button
         className="sb-item sb-dir"
-        title="点击修改工作目录"
+        title={dirLabel + "（点击修改工作目录）"}
         onClick={() => {
           setDirInput(conv.workDir);
           setEditingDir(true);
@@ -38,6 +40,32 @@ export default function SessionBar({ conv, providers, cacheRate, engineeringMode
       >
         <FolderOpen size={13} />
         <span className="sb-dir-text">{dirLabel}</span>
+      </button>
+
+      <button
+        className="sb-item sb-export"
+        title="导出会话日志：JSONL（完整事件日志，含推理/工具调用/任务图）或 Markdown（可读转写）；文件名后缀 .md 导出 Markdown，否则导出 JSONL"
+        onClick={async () => {
+          try {
+            const { save } = await import("@tauri-apps/plugin-dialog");
+            const safeTitle = (conv.title || "会话").replace(/[\\/:*?"<>|\s]+/g, "-").slice(0, 40);
+            const path = await save({
+              defaultPath: "canlow-" + safeTitle + ".jsonl",
+              filters: [
+                { name: "会话日志", extensions: ["jsonl", "md"] },
+              ],
+            });
+            if (!path) return;
+            const format = path.toLowerCase().endsWith(".md") ? "markdown" : "jsonl";
+            const written = await sessionExport(conv.id, path, format);
+            alert("✅ 会话日志已导出：" + written);
+          } catch (e) {
+            alert("❌ 导出失败：" + String(e));
+          }
+        }}
+      >
+        <Download size={13} />
+        导出
       </button>
 
       <label className="sb-item">
@@ -97,7 +125,10 @@ export default function SessionBar({ conv, providers, cacheRate, engineeringMode
         工程模式
       </label>
 
-      <span className={"sb-item sb-cache" + (cacheRate >= 90 ? " good" : "")} title="DeepSeek 前缀缓存命中率">
+      <span
+        className={"sb-item sb-cache" + (cacheRate >= 90 ? " good" : "")}
+        title={"DeepSeek 前缀缓存命中率（prompt_cache_hit_tokens）：命中 " + cacheHit.toLocaleString() + " / 未命中 " + cacheMiss.toLocaleString() + " tokens"}
+      >
         ⚡ 缓存 {cacheRate.toFixed(1)}%
       </span>
 

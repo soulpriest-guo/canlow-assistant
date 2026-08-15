@@ -10,3 +10,4 @@ src-tauri/gen
 .vscode
 Thumbs.db
 *.pid
+src-tauri/$PWD/

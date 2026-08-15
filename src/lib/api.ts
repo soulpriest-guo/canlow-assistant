@@ -35,6 +35,17 @@ export const sessionUpdate = (
   }>
 ) => invoke<void>("session_update", { id, ...patch });
 export const sessionMessages = (id: string) => invoke<ChatMessage[]>("session_messages", { id });
+/** 导出会话日志（jsonl=完整事件日志 / markdown=可读转写），返回写入路径 */
+export const sessionExport = (id: string, path: string, format: "jsonl" | "markdown") =>
+  invoke<string>("session_export", { convId: id, path, format });
+
+// ---------- 技能 ----------
+export const skillsList = (workDir: string) =>
+  invoke<[string, string, string, string][]>("skills_list", { workDir });
+export const skillCreate = (workDir: string, name: string, description: string, content: string) =>
+  invoke<string>("skill_create", { workDir, name, description, content });
+export const skillOpenDir = (workDir: string, target: "project" | "user") =>
+  invoke<string>("skill_open_dir", { workDir, target });
 
 // ---------- 上下文档位 ----------
 export const contextProfileGet = () => invoke<string>("context_profile_get");

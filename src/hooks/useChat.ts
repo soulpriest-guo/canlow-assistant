@@ -232,6 +232,7 @@ export function useChat() {
     setActiveId(conv.id);
     setMessages([]);
     setDebugStat({ content: 0, reasoning: 0, done: false });
+    setCacheStats({ hit: 0, miss: 0, rate: 0 });
   }, []);
 
   // 带项目信息的创建（名称 + 工作目录）
@@ -247,6 +248,7 @@ export function useChat() {
     setActiveId(conv.id);
     setMessages([]);
     setDebugStat({ content: 0, reasoning: 0, done: false });
+    setCacheStats({ hit: 0, miss: 0, rate: 0 });
     return conv;
   }, []);
 
@@ -259,6 +261,8 @@ export function useChat() {
     const msgs = await sessionMessages(id);
     setMessages(msgs);
     setDebugStat({ content: 0, reasoning: 0, done: false });
+    // 缓存统计按会话隔离：切换会话时清空，避免显示上一个会话的命中率
+    setCacheStats({ hit: 0, miss: 0, rate: 0 });
   }, []);
 
   const deleteConversation = useCallback(

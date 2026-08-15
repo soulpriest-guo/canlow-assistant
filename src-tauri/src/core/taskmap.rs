@@ -1580,7 +1580,7 @@ pub fn plan_tool_definitions() -> Value {
             "title": s("任务标题"),
             "detail": s("任务详情"),
             "key": s("任务标识（可选）：供本批 tasks 的 deps 引用，如 a/b/c"),
-            "deps": json!({"type": "array", "items": {"type": "string"}, "description": "执行顺序声明：本任务须在列出的任务之后执行（引用本批 key 或已有节点 ID/标题）。不填表示按创建顺序与同层级任务依次竖排执行。图的上下排列就是实际执行顺序指令"}),
+            "deps": json!({"type": "array", "items": {"type": "string"}, "description": "执行顺序声明：本任务须在列出的任务之后执行（引用本批 key 或已有节点 ID/标题）；不填表示按创建顺序与同层级任务依次执行"}),
             "children": {"type": "array"}
         });
         if let Some(obj) = extra.as_object() {
@@ -1591,11 +1591,11 @@ pub fn plan_tool_definitions() -> Value {
         json!({"type": "array", "items": {"type": "object", "properties": props}})
     };
     json!([
-        f("plan_init", "创建任务图（工程模式第一步，只能调用一次）。★ 层级语义：任务目标节点（root）是唯一总节点（高于一级，只在一开始创建时存在）；一级任务=任务总结（对整个任务的总结/目标），挂到任务目标总节点下；二级=完成一级任务的方法步骤；三级=进一步细分，以此类推。★ breakdown 顶层任务 = 一级任务（任务总结，1-3 个），不要把具体步骤塞进顶层导致平铺。★ 任务编号规则：编号=父任务自身编号段+本级字母+本级数字（如 a1 → a1b2 → b2c1），同一字母层级数字全局不重复。★ 小步规划：顶层任务最多 5 个。★ 执行顺序语义：图排列=实际执行顺序指令（默认从上到下串行执行）；需先后执行的用 deps 声明（先执行者作为后执行者的 deps，形成串行链 → 上下排列）；当前无子代理，同级任务一律竖排，不设横向并排", json!({
+        f("plan_init", "创建任务图（工程模式第一步，本会话只能调用一次；已存在时用 plan_requirement 更新需求）。★ breakdown 顶层 = 一级任务（任务总结，1-3 个，最多 5 个），挂到任务目标总节点（root）下；具体步骤用 plan_breakdown 逐层细化，不要平铺在顶层。★ 任务编号 = 父任务自身编号段 + 本级字母 + 本级数字（a1 → a1b2 → b2c1）。★ 层级语义、执行顺序（deps/图的上下排列）、执行纪律遵循 system 提示中的工程模式规则", json!({
             "requirement": s("用户需求描述"),
             "breakdown": task_item(json!({}))
         }), vec!["requirement"]),
-        f("plan_breakdown", "在节点下添加子任务（单批最多 10 个，建议 3-5 个分批添加）。★ 一级任务（任务总结）添加：parent_id 省略或 root 时在任务目标总节点（root）下新增一级任务（任务总结）——包括多轮对话中差异大的新需求也这样添加；其它 parent_id = 在对应任务下添加子任务（方法步骤/细分）。同级任务需先后执行的用 deps 声明顺序（先执行者作为后执行者的 deps，引用本批 key 或已有节点 ID/标题）；当前无子代理，同级任务一律竖排依次执行，不设横向并行", json!({
+        f("plan_breakdown", "在节点下添加子任务（单批最多 10 个，建议 3-5 个分批）。★ parent_id 省略或 root = 在任务目标总节点下新增一级任务（任务总结，包括多轮对话中差异大的新需求）；top/top_level = 创建与 root 平级的独立一级任务线；其它 = 在对应任务（ID 或标题）下添加方法步骤/细分。同级需先后执行的用 deps 声明（先执行者作为后执行者的 deps，引用本批 key 或已有节点 ID/标题）；当前无子代理，同级任务一律竖排依次执行", json!({
             "parent_id": s("父任务ID：省略或 root = 在任务目标总节点下新增一级任务（任务总结）；其它 = 已有节点 ID/标题（添加方法步骤/细分）"),
             "tasks": task_item(json!({}))
         }), vec!["tasks"]),

@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::error::Error as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -16,26 +16,37 @@ use super::taskmap::{TaskMap, TaskMapData, TaskMapStore};
 use super::tools::{self, CmdRegistry};
 use super::types::{ChatMessage, ProviderConfig, ToolCall};
 
-pub fn build_system_prompt(engineering_mode: bool, taskmap_review: Option<&str>) -> String {
-    let mut p = r#"你是 Canlow，一个智能编程助手。
-你与用户共享一个工作区。保持对话简洁、直接，用中文回复。
-可以使用工具完成任务：文件操作、搜索、Git、命令执行、任务图规划。
-规则：
+/// 所有系统自动注入、不应展示给用户的内部消息统一前缀。
+/// 这些消息只参与请求组装，不写入会话历史（旧版本可能已写入，读取时按此前缀过滤/清理）。
+pub const SYSTEM_INJECT_MARKER: &str = "（系统注入，非用户消息）";
+/// 工作纪律 + 工程模式规则消息的固定标记（首轮请求中作为第一条 user 消息注入，
+/// 用于保持 system 极简且缓存前缀稳定）。
+pub const RULES_MARKER: &str = "（系统注入，非用户消息）【工作纪律与工程模式规则】";
+
+/// 判断是否为系统自动注入的内部消息（不应展示给用户）。
+pub fn is_internal_injected_message(msg: &ChatMessage) -> bool {
+    msg.role == "user" && msg.content.starts_with(SYSTEM_INJECT_MARKER)
+}
+
+/// 极简固定 system（对齐 DSH minimal 的「一句话 persona」）：
+/// - 纯静态，永远不变 → 缓存前缀绝对稳定
+/// - 工作纪律与工程模式规则全部移到消息层（每次请求注入为第一条 user 消息，不落库）
+pub fn build_core_system_prompt() -> String {
+    "你是 Canlow，一个智能编程助手。你与用户共享一个工作区。使用工具完成任务，不要编造执行结果。"
+        .to_string()
+}
+
+/// 工作纪律 + 工程模式详细规则（借鉴 anchored 思路：不进 system，
+/// 每次请求组装时作为第一条 user 消息注入，不写入会话历史——
+/// system 保持一句话，规则文本位置固定，前缀稳定缓存友好）
+fn build_work_rules_text() -> String {
+    r#"【工作纪律】
 1. 命令执行后用 check_command 跟进一次状态。
-2. 大文件用 read_file_segment 分段读取。
-3. 修改文件小改动用 replace_in_file，重写用 write_file。
+2. 大项目策略：先 glob_search / grep_search 定位，再用 read_file 的 paths 参数一次读多个文件，不要逐个单文件读取。
+3. 大文件用 read_file_segment 分段读取。
 4. 所有路径为相对路径。
-5. 大项目策略：先 glob_search / grep_search 定位，再用 read_file 的 paths 参数一次读多个文件，不要逐个单文件读取。
-6. 工具输出可能被截断（会有提示）：被截断时用针对性读取/搜索获取需要部分，不要盲目重读整个文件。
-7. 工具失败不要盲目重试；连续 2 次失败就基于已有信息回答。
-8. 可用 get_context_remaining 查看剩余上下文空间，据此决定继续读取还是先总结。
-9. 早期对话被压缩后完整内容会自动归档，search_conversation_history 会同时搜索当前历史和归档快照；需要找回被压缩的细节时用它，取回后直接使用，不要反复搜索。
-10. 【联网搜索】需要最新/实时信息（新闻、版本号、API 文档、天气、事件、你不知道的事实等）时，必须优先调用 search_web 工具——它是内置联网搜索，会返回带来源的结果。fetch_webpage 只能抓取你【已经知道】的具体 URL，不能代替搜索。search_web 结果不够时，再用 fetch_webpage 抓取结果中的链接看细节。
-11. 完成目标后必须立即给出最终总结，不要继续调用工具。"#
-        .to_string();
-    if engineering_mode {
-        p.push_str(
-            "
+5. 工具失败不要盲目重试；连续 2 次失败就基于已有信息回答。
+6. 完成目标后必须立即给出最终总结，不要继续调用工具。
 
 【工程模式】当前已开启：任务图是唯一的执行计划，你必须严格按图执行。
               ★ 任务图尚未创建时（本会话还没有任务图）：
@@ -74,14 +85,19 @@ pub fn build_system_prompt(engineering_mode: bool, taskmap_review: Option<&str>)
               - plan_update 支持批量：tasks: [{task_id, status}] 一次更新多个任务；
               - task_id 可以用标题引用（唯一匹配自动解析），或先用 plan_find 按标题搜索拿到 ID；
               - plan_review 可加 node_id 只看某子树，大图时按需查看；
-              - 用户修改任务图后：必须重新审视计划，必要时用 plan_requirement / plan_breakdown / plan_link 调整，然后继续按新图执行。",
-        );
+              - 用户修改任务图后：必须重新审视计划，必要时用 plan_requirement / plan_breakdown / plan_link 调整，然后继续按新图执行。"#
+        .to_string()
+}
+/// 兼容入口：core + 可选工程规则 + 可选任务图评审
+/// （主循环已改为 core-only + 消息层注入；子代理/摘要用 false）
+pub fn build_system_prompt(engineering_mode: bool, taskmap_review: Option<&str>) -> String {
+    let mut p = build_core_system_prompt();
+    if engineering_mode {
+        p.push_str("\n\n");
+        p.push_str(&build_work_rules_text());
     }
     if let Some(review) = taskmap_review {
-        p.push_str("
-
-【当前任务图状态】
-");
+        p.push_str("\n\n【当前任务图状态】\n");
         p.push_str(review);
     }
     p
@@ -162,18 +178,72 @@ const STRUCT_TOOLS: &[&str] = &[
     "plan_requirement",
 ];
 
+/// 子代理运行条目（后台/前台子代理共享；状态存内存，不落库）
+pub struct SubagentEntry {
+    pub id: String,
+    pub description: String,
+    pub prompt: String,
+    /// 发起方会话（权限弹窗与通知都路由到该会话，前端无需改动）
+    pub parent_conv_id: String,
+    pub running: AtomicBool,
+    pub stop_flag: AtomicBool,
+    pub result: Mutex<Option<String>>,
+    pub pending_permissions: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    pub turn_count: AtomicU32,
+    pub started_at: i64,
+    pub finished_at: Mutex<Option<i64>>,
+}
+
+impl SubagentEntry {
+    pub fn new(id: String, description: String, prompt: String, parent_conv_id: String) -> Self {
+        Self {
+            id,
+            description,
+            prompt,
+            parent_conv_id,
+            running: AtomicBool::new(false),
+            stop_flag: AtomicBool::new(false),
+            result: Mutex::new(None),
+            pending_permissions: Mutex::new(HashMap::new()),
+            turn_count: AtomicU32::new(0),
+            started_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+            finished_at: Mutex::new(None),
+        }
+    }
+
+    pub fn set_done(&self, result: String) {
+        *self.result.lock().unwrap() = Some(result);
+        self.running.store(false, Ordering::Relaxed);
+        *self.finished_at.lock().unwrap() = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+    }
+}
+
 pub struct AgentState {
     /// conv_id -> 会话状态
     pub sessions: Mutex<HashMap<String, Arc<AgentSession>>>,
     /// 全局授权模式（跨会话生效）
     pub auth_mode: Arc<AtomicU8>,
+    /// 数据库句柄（Arc 以便后台子代理任务持有）
+    pub db: Arc<Db>,
+    /// subagent_id -> 子代理条目
+    pub subagents: Mutex<HashMap<String, Arc<SubagentEntry>>>,
 }
 
-impl Default for AgentState {
-    fn default() -> Self {
+impl AgentState {
+    pub fn new(db: Arc<Db>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             auth_mode: Arc::new(AtomicU8::new(AUTH_SMART)),
+            db,
+            subagents: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -192,6 +262,7 @@ pub fn is_safe_tool(name: &str) -> bool {
             | "todo_list" | "plan_review" | "fetch_webpage" | "search_web" | "check_command"
             | "plan_init" | "plan_breakdown" | "plan_update" | "plan_link" | "plan_requirement"
             | "plan_move" | "plan_export" | "plan_find" | "plan_undo" | "plan_focus"
+            | "skill" | "subagent" | "subagent_report" | "list_agents" | "interrupt_agent"
     )
 }
 
@@ -354,8 +425,24 @@ fn log_request_fingerprint(app: &AppHandle, messages: &[ChatMessage], tools: &Va
     }
 }
 
+/// DSH 风格重试退避：指数增长 + 确定性抖动（初始 500ms，上限 10s，抖动 ±10%）
+fn dsh_retry_delay_ms(attempt: u32) -> u64 {
+    let base = (500u64 * 2u64.pow(attempt.saturating_sub(1))).min(10_000);
+    let jitter = (attempt as u64).wrapping_mul(2_654_435_761) % (base / 10 + 1);
+    base + jitter
+}
+
+/// 流式请求 —— DSH llm-deepseek 适配器请求纪律的完整移植（全局默认行为）：
+/// - stream_options.include_usage：确保流式返回 usage（缓存命中统计的前置条件）
+/// - reasoning_content 回传规则（按提供商 supports_thinking 自动决定）：
+///   支持思考的提供商仅在带 tool_calls 的轮次回传（API 要求），纯文本轮次丢弃省 token；
+///   不支持的提供商永不发送该字段（它们不认识它，可能 400）
+/// - 空工具输出以 "(no output)" 占位（DSH 序列化规则）
+/// - 429/5xx/网络错误：有界指数退避 + 抖动重试（3 次），尊重 Retry-After
+/// app 按值传入：AppHandle 是 Send 而非 Sync，&AppHandle 跨 await 不满足 Send，
+/// 子代理后台任务（tokio::spawn）需要 Send 未来。
 async fn stream_request(
-    app: &AppHandle,
+    app: AppHandle,
     provider: &ProviderConfig,
     messages: &[ChatMessage],
     tools: &Value,
@@ -378,11 +465,19 @@ async fn stream_request(
                 "role": m.role,
                 "content": m.content,
             });
-            if let Some(rc) = &m.reasoning_content {
-                obj["reasoning_content"] = json!(rc);
-            } else if m.tool_calls.is_some() {
-                // DeepSeek thinking 模式：带 tool_calls 的 assistant 消息必须回传 reasoning_content
-                obj["reasoning_content"] = json!("");
+            // ★ reasoning_content 回传规则（DSH reasoning passback rule，按提供商自动）：
+            //   - 支持思考的提供商：仅在带 tool_calls 的轮次回传（API 要求）；
+            //     纯文本轮次丢弃（DSH：不为被忽略的推理内容重复付费）
+            //   - 不支持的提供商：永不发送（OpenAI/Kimi 等不认识该字段）
+            if provider.supports_thinking {
+                if let Some(rc) = &m.reasoning_content {
+                    if m.tool_calls.is_some() {
+                        obj["reasoning_content"] = json!(rc);
+                    }
+                } else if m.tool_calls.is_some() {
+                    // 思考模式：带 tool_calls 的 assistant 消息必须回传 reasoning_content
+                    obj["reasoning_content"] = json!("");
+                }
             }
             if let Some(tcs) = &m.tool_calls {
                 obj["tool_calls"] = json!(tcs.iter().map(|tc| {
@@ -402,11 +497,15 @@ async fn stream_request(
             if let Some(n) = &m.name {
                 obj["name"] = json!(n);
             }
+            // ★ 空工具输出占位（DSH 序列化规则）：空内容过线会丢失语义
+            if m.role == "tool" && obj["content"].as_str().unwrap_or("").trim().is_empty() {
+                obj["content"] = json!("(no output)");
+            }
             obj
         })
         .collect();
 
-    log_request_fingerprint(app, messages, tools, &provider.model);
+    log_request_fingerprint(&app, messages, tools, &provider.model);
 
     let mut payload = json!({
         "model": provider.model,
@@ -415,6 +514,8 @@ async fn stream_request(
         "tools": tools,
         "tool_choice": "auto",
     });
+    // ★ 流式返回 usage（缓存命中统计的前置条件；OpenAI 兼容 API 标准字段）
+    payload["stream_options"] = json!({"include_usage": true});
     if let Some(thinking) = provider.thinking {
         payload["thinking"] = json!({"type": if thinking { "enabled" } else { "disabled" }});
     }
@@ -422,9 +523,14 @@ async fn stream_request(
         payload["reasoning_effort"] = json!(effort);
     }
 
-    // 连接阶段重试（偶发网络失败）：最多 3 次，退避 1s/2s
-    let mut resp = None;
-    for attempt in 0..3 {
+    // ★ 重试策略（DSH llm-retry 风格，全局默认）：网络错误 / HTTP 429 / 5xx
+    //   均可重试（最多 3 次请求），指数退避 + 抖动（初始 500ms、上限 10s），
+    //   429 优先尊重 Retry-After
+    let max_attempts = 3u32;
+    let mut resp: Option<reqwest::Response> = None;
+    let mut attempt = 0u32;
+    while attempt < max_attempts {
+        attempt += 1;
         match client
             .post(&url)
             .header("Authorization", format!("Bearer {}", provider.api_key))
@@ -433,16 +539,42 @@ async fn stream_request(
             .await
         {
             Ok(r) => {
+                let status = r.status();
+                let retryable = status.as_u16() == 429 || status.as_u16() >= 500;
+                if attempt < max_attempts && retryable {
+                    // 可重试的限流/服务器错误：退避后重试（尊重 Retry-After）
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let delay = if let Some(ra) = retry_after {
+                        (ra * 1000).min(10_000)
+                    } else {
+                        dsh_retry_delay_ms(attempt)
+                    };
+                    let msg = format!("HTTP {status}，{} 秒后重试 ({}/{})", delay / 1000, attempt, max_attempts);
+                    let _ = app.emit("stream-notice", json!({"message": msg, "convId": conv_id}));
+                    if stop_flag.load(Ordering::Relaxed) {
+                        return Err("已停止".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
                 resp = Some(r);
                 break;
             }
             Err(e) => {
-                if attempt == 2 {
+                if attempt >= max_attempts {
                     return Err(format!("请求失败: {}", full_error(&e)));
                 }
-                let delay = 1000 * (attempt as u64 + 1);
-                let msg = format!("网络连接失败，{} 秒后重试 ({}/{})", delay / 1000, attempt + 1, 3);
+                // 连接失败：指数退避 + 抖动
+                let delay = dsh_retry_delay_ms(attempt);
+                let msg = format!("网络连接失败，{} 秒后重试 ({}/{})", delay / 1000, attempt, max_attempts);
                 let _ = app.emit("stream-notice", json!({"message": msg, "convId": conv_id}));
+                if stop_flag.load(Ordering::Relaxed) {
+                    return Err("已停止".into());
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
         }
@@ -643,18 +775,170 @@ pub fn context_profile(db: &Db) -> ContextProfile {
             budget_tokens: 200_000,
         },
         _ => ContextProfile {
-            max_chars: 2_400_000,      // 约 800k tokens（1M 窗口，最大化缓存利用）
+            // ★ 压缩阈值从 2.4M 下调到 1.8M 字符（约 600k tokens）：更早压缩，
+            //   中期对话每轮少背历史（借鉴 DSH thresholdRatio 0.8 的思路）
+            max_chars: 1_800_000,      // 约 600k tokens（1M 窗口，留足输出与缓存余量）
             user_budget_chars: 120_000, // 约 4 万 tokens 用户消息
             keep_recent_chars: 400_000, // 约 13 万 tokens 最近消息（覆盖 4-5 轮工作）
-            budget_tokens: 800_000,
+            budget_tokens: 600_000,    // 与压缩阈值一致（get_context_remaining 报告口径）
         },
     }
 }
 
-pub fn compact_history_if_needed(
+/// 压缩前工具结果修剪阈值（借鉴 DSH compaction-tool-result-pruner）：
+/// 触发压缩时，超大工具结果改写为 head + 省略标记 + tail，原文存入缓存表。
+const PRUNE_THRESHOLD_CHARS: usize = 8_192;
+const PRUNE_HEAD_CHARS: usize = 4_096;
+const PRUNE_TAIL_CHARS: usize = 1_024;
+
+/// 修剪超大工具结果（原地改写，原文入缓存可 retrieve 取回）。
+fn prune_oversized_tool_results(db: &Db, conv_id: &str, msgs: &mut Vec<ChatMessage>) {
+    for m in msgs.iter_mut() {
+        if m.role != "tool" {
+            continue;
+        }
+        let chars: Vec<char> = m.content.chars().collect();
+        if chars.len() <= PRUNE_THRESHOLD_CHARS {
+            continue;
+        }
+        let name = m.name.clone().unwrap_or_default();
+        let entry_json = serde_json::to_string(&[m.clone()]).unwrap_or_default();
+        let entry_id = db
+            .cache_add(
+                conv_id,
+                &format!("压缩时修剪的超大工具结果（{name}，{} 字符）", chars.len()),
+                &entry_json,
+            )
+            .unwrap_or(0);
+        let head: String = chars.iter().take(PRUNE_HEAD_CHARS).collect();
+        let tail_start = chars.len().saturating_sub(PRUNE_TAIL_CHARS);
+        let tail: String = chars.iter().skip(tail_start).collect();
+        let omitted = chars.len().saturating_sub(PRUNE_HEAD_CHARS + PRUNE_TAIL_CHARS);
+        if entry_id > 0 {
+            m.content = format!(
+                "{head}
+
+……[中间 {omitted} 字符已修剪；完整结果已存档为缓存条目 #{entry_id}，可用 retrieve_cache_entry 取回]……
+
+{tail}"
+            );
+        } else {
+            m.content = format!("{head}
+
+……[中间 {omitted} 字符已修剪]……
+
+{tail}");
+        }
+    }
+}
+
+/// LLM 摘要（借鉴 DSH compaction-basic）：用同一提供商/模型生成压缩摘要。
+/// 请求只发 被压缩消息 + 摘要指令（system 固定），失败时回退本地规则摘要。
+/// 返回 None 表示不可用（无 key / 请求失败 / 输出为空）。
+async fn llm_summarize(provider: Option<&ProviderConfig>, dropped: &[ChatMessage]) -> Option<String> {
+    let provider = provider?;
+    if provider.api_key.is_empty() || dropped.is_empty() {
+        return None;
+    }
+    // 取最后 200k 字符（保持消息对完整；截断边界由 fix_tool_sequence 兜底）
+    let mut msgs: Vec<ChatMessage> = Vec::new();
+    let mut total = 0usize;
+    for m in dropped.iter().rev() {
+        let len = m.content.len() + m.reasoning_content.as_deref().unwrap_or("").len();
+        if !msgs.is_empty() && total + len > 200_000 {
+            break;
+        }
+        msgs.push(m.clone());
+        total += len;
+        if total >= 200_000 {
+            break;
+        }
+    }
+    msgs.reverse();
+    // 去掉开头孤立的 tool 消息（API 要求 tool 前必须有 assistant tool_calls）
+    while msgs.first().map(|m| m.role == "tool").unwrap_or(false) {
+        msgs.remove(0);
+    }
+    let mut fixed = msgs.clone();
+    fix_tool_sequence(&mut fixed);
+    let api_messages: Vec<Value> = fixed
+        .iter()
+        .map(|m| {
+            let mut obj = json!({"role": m.role, "content": m.content});
+            if m.role == "assistant" && m.tool_calls.is_some() {
+                if let Some(rc) = &m.reasoning_content {
+                    obj["reasoning_content"] = json!(rc);
+                } else {
+                    obj["reasoning_content"] = json!("");
+                }
+                obj["tool_calls"] = json!(m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| {
+                            json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            if let Some(tcid) = &m.tool_call_id {
+                obj["tool_call_id"] = json!(tcid);
+            }
+            obj
+        })
+        .collect();
+    if api_messages.is_empty() {
+        return None;
+    }
+    let mut wire: Vec<Value> = Vec::new();
+    wire.push(json!({"role": "system", "content": build_system_prompt(false, None)}));
+    wire.extend(api_messages);
+    wire.push(json!({"role": "user", "content":
+        "请把上面这段对话历史压缩成一份紧凑的中文摘要（300 字以内）：保留已完成的结论、正在进行的任务、关键文件路径和下一步计划；不要复述过程细节，不要使用工具。"}));
+    let mut payload = json!({
+        "model": provider.model,
+        "messages": wire,
+        "stream": false,
+        "max_tokens": 2048,
+    });
+    // DeepSeek 摘要请求关掉思考，省 token；其它提供商不发送其不认识的字段
+    if provider.base_url.contains("deepseek") {
+        payload["thinking"] = json!({"type": "disabled"});
+    }
+    let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .ok()?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .json(&payload)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    v.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|ch| ch.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub async fn compact_history_if_needed(
     db: &Db,
     conv_id: &str,
     history: Vec<ChatMessage>,
+    provider: Option<&ProviderConfig>,
 ) -> Result<Vec<ChatMessage>, String> {
     let profile = context_profile(db);
     let max_chars = profile.max_chars;
@@ -668,6 +952,10 @@ pub fn compact_history_if_needed(
     if total_chars <= max_chars {
         return Ok(history);
     }
+
+    // ★ 触发压缩后先修剪超大工具结果（无模型调用；原文入缓存可取回）
+    let mut history = history;
+    prune_oversized_tool_results(db, conv_id, &mut history);
 
     let n = history.len();
     // 最近保留起点：从末尾往前累计字符直到预算，并向前扩展避开孤立的 tool 消息
@@ -715,7 +1003,13 @@ pub fn compact_history_if_needed(
         // 被压缩掉的原文单独存一份（便于按需取回）
         let data = serde_json::to_string(&dropped).map_err(|e| e.to_string())?;
         let _ = db.cache_add(conv_id, "上下文压缩保存的原始消息", &data);
-        let summary = local_summarize(&dropped);
+        // ★ 摘要优先用 LLM 生成（DSH compaction-basic 思路，复用同一请求前缀缓存）；
+        //   失败/无 key 时回退本地规则摘要（免费兜底）
+        let summary = match llm_summarize(provider, &dropped).await {
+            Some(s) => format!("[对话摘要] 以下是之前对话的交接摘要：
+{s}"),
+            None => local_summarize(&dropped),
+        };
         selected.push(ChatMessage {
             role: "assistant".into(),
             content: summary,
@@ -748,9 +1042,15 @@ fn full_error(e: &reqwest::Error) -> String {
     parts.join(" | ")
 }
 
-/// 工具结果截断：约 40k tokens（120000 字符；比 Codex 的 truncation_policy 更宽，
-/// 仅在输出极大时截断，保留足够上下文供模型分析）
-const MAX_TOOL_RESULT_CHARS: usize = 120_000;
+/// 工具结果「落盘」阈值与预览尺寸（借鉴 DSH spill-policy）：
+/// 结果超过阈值时完整文本存入缓存表（retrieve_cache_entry 可取回），
+/// 历史里只保留 头 + 取回提示 + 尾 —— 防止大结果在每轮请求里重复付费。
+const SPILL_THRESHOLD_CHARS: usize = 30_000;
+const SPILL_HEAD_CHARS: usize = 3_000;
+const SPILL_TAIL_CHARS: usize = 1_000;
+
+/// 工具结果硬截断上限（仅当落盘失败时兜底使用）
+const MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
 fn truncate_tool_result(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -762,6 +1062,39 @@ fn truncate_tool_result(text: &str) -> String {
         )
     } else {
         text.to_string()
+    }
+}
+
+/// 工具结果落盘：超大结果 -> 缓存表存档 + 头尾预览（DSH spill 思路）。
+/// 存档以消息数组 JSON 写入，search_conversation_history 也能命中。
+fn spill_tool_result(db: &Db, conv_id: &str, tool_name: &str, text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= SPILL_THRESHOLD_CHARS {
+        return text.to_string();
+    }
+    let entry_json = serde_json::to_string(&[ChatMessage::tool_result("spill", tool_name, text)])
+        .unwrap_or_default();
+    match db.cache_add(
+        conv_id,
+        &format!("工具结果存档（{tool_name}，{} 字符）", chars.len()),
+        &entry_json,
+    ) {
+        Ok(entry_id) => {
+            let head: String = chars.iter().take(SPILL_HEAD_CHARS).collect();
+            let tail_start = chars.len().saturating_sub(SPILL_TAIL_CHARS);
+            let tail: String = chars.iter().skip(tail_start).collect();
+            format!(
+                "{head}
+
+……（完整结果 {len} 字符已存档为缓存条目 #{id}，需要时用 retrieve_cache_entry 取回；也可用 search_conversation_history 搜索其内容）……
+
+{tail}",
+                len = chars.len(),
+                id = entry_id,
+            )
+        }
+        // 落盘失败：退化为截断
+        Err(_) => truncate_tool_result(text),
     }
 }
 
@@ -984,22 +1317,39 @@ pub async fn run_agent_turn(
         let pre_turn_map = taskmaps.lock().unwrap().get(&conv_id).cloned();
 
         // 1) 组装消息：固定 system + 完整历史（追加式；超限时压缩早期内容）
-        let history = compact_history_if_needed(db, &conv_id, db.load_messages(&conv_id)?)?;
-        let mut api_messages: Vec<ChatMessage> = Vec::with_capacity(history.len() + 1);
+        //    ★ 压缩支持 LLM 摘要（用当前会话的 provider/model，失败回退本地摘要）
+        // 先清理旧版本可能持久化的内部注入消息：它们只参与请求组装，不应出现在
+        // 用户可见历史/导出里；清理后如果触发压缩，也不会把这段内部规则算进预算。
+        let mut history = db.load_messages(&conv_id)?;
+        let cleaned: Vec<ChatMessage> = history
+            .iter()
+            .filter(|m| !is_internal_injected_message(m))
+            .cloned()
+            .collect();
+        if cleaned.len() != history.len() {
+            let _ = db.replace_messages(&conv_id, &cleaned);
+            history = cleaned;
+        }
+        let history = compact_history_if_needed(db, &conv_id, history, Some(&provider)).await?;
+        let mut api_messages: Vec<ChatMessage> = Vec::with_capacity(history.len() + 2);
 
         // 工程模式：无任务图时只开放 plan_init；有图时注入任务图状态
-        // ★ system 第一条必须固定（任务图状态改由末尾注入，避免每次变化导致全量缓存失效）
+        // ★ system 第一条必须固定且极简（一句话 persona 思路：纯静态，缓存前缀绝对稳定）
         let has_map = taskmaps.lock().unwrap().contains_key(&conv_id);
         // ★ 工程模式机制始终生效（会话的 engineering_mode 开关只控制前端任务图显示，
         //   不影响 AI 的计划流程与执行纪律）
+        // ★ 工作纪律+工程模式规则：只注入到本次请求的 api_messages，不写回 DB。
+        //   这样 UI/导出不会看到内部消息，同时 system 保持极简、缓存前缀稳定。
+        let rules_message = ChatMessage::user(format!("{RULES_MARKER}\n{}", build_work_rules_text()));
         api_messages.push(ChatMessage {
             role: "system".into(),
-            content: build_system_prompt(true, None),
+            content: build_core_system_prompt(),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
         });
+        api_messages.push(rules_message);
         api_messages.extend(history.iter().cloned());
 
         // ★ 不再注入「接近预算请立即总结」类提醒：上下文超限由
@@ -1013,8 +1363,9 @@ pub async fn run_agent_turn(
         //   message with 'tool_calls'），且错位补丁会持续累积。
         let seq_patches = fix_tool_sequence(&mut api_messages);
         if !seq_patches.is_empty() {
-            // api_messages = [system, ...history]；写回时去掉 system（每轮由 build_system_prompt 重建）
-            let fixed_history: Vec<ChatMessage> = api_messages.iter().skip(1).cloned().collect();
+            // api_messages = [system, rules_message, ...history]；写回时去掉 system 和内部规则消息
+            // （二者每轮由请求组装逻辑重建，不落库）
+            let fixed_history: Vec<ChatMessage> = api_messages.iter().skip(2).cloned().collect();
             let _ = db.replace_messages(&conv_id, &fixed_history);
         }
 
@@ -1103,6 +1454,22 @@ pub async fn run_agent_turn(
                 name: None,
             });
         }
+        // 3f) 技能目录注入（尾部 retain+replace，system 保持极简 → 前缀稳定）
+        {
+            let skill_marker = "【可用技能】";
+            api_messages.retain(|m| !(m.role == "user" && m.content.contains(skill_marker)));
+            let skills_text = skill_catalog_text(&work_dir);
+            if !skills_text.is_empty() {
+                push_tail_message(&mut api_messages, ChatMessage {
+                    role: "user".into(),
+                    content: format!("（系统注入，非用户消息）{skills_text}"),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+        }
 
         // ★ 工具列表：任务图工具始终提供（AI 可主动建图/更新）
         // 规划模式（plan_only）或 尚无任务图：只开放 plan 工具 + 只读探索工具
@@ -1116,6 +1483,16 @@ pub async fn run_agent_turn(
             "search_web", "fetch_webpage", "check_command",
             "search_conversation_history", "get_context_remaining",
         ];
+        // ★ anchored 首轮精简集（对齐 DSH anchored-standard：首轮一句话 persona + 极简工具，
+        //   首个工具调用后恢复全量）——plan 闭环 4 个（plan_init 建图 / plan_breakdown 细化 /
+        //   plan_update 声明焦点 / plan_review 看状态）+ run_command/replace_in_file
+        //   （对应 DSH minimal 的 bash/str_replace_editor）。首轮工具即建图后同轮执行也不会死锁。
+        const ANCHORED_FIRST_TOOLS: &[&str] = &[
+            "plan_init", "plan_breakdown", "plan_update", "plan_review",
+            "run_command", "replace_in_file",
+        ];
+        // 是否首轮：历史中还没有任何工具调用（首个工具调用后恢复全量）
+        let anchored_first_round = !api_messages.iter().any(|m| m.role == "tool");
         let all_tools = {
             let base = tools::tool_definitions();
             let plan = tools::taskmap_tools();
@@ -1125,7 +1502,7 @@ pub async fn run_agent_turn(
             }
             serde_json::Value::Array(merged)
         };
-        let tools: Value = if plan_only || !has_map {
+        let filter_by_names = |names: &[&str]| -> Value {
             let plan = tools::taskmap_tools();
             let mut merged = plan.as_array().cloned().unwrap_or_default();
             if let Some(base) = tools::tool_definitions().as_array() {
@@ -1134,12 +1511,21 @@ pub async fn run_agent_turn(
                         .pointer("/function/name")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if READONLY_TOOLS.contains(&name) {
+                    if names.contains(&name) {
                         merged.push(t.clone());
                     }
                 }
             }
             serde_json::Value::Array(merged)
+        };
+        let tools: Value = if plan_only {
+            filter_by_names(READONLY_TOOLS)
+        } else if anchored_first_round {
+            // ★ anchored：首轮极简工具集（首个工具调用后自然恢复全量）
+            filter_by_names(ANCHORED_FIRST_TOOLS)
+        } else if !has_map {
+            // 工程模式未建图：plan + 只读探索
+            filter_by_names(READONLY_TOOLS)
         } else {
             all_tools
         };
@@ -1150,7 +1536,7 @@ pub async fn run_agent_turn(
 
         // 2) 流式请求
         let (content, reasoning, tool_calls, usage) = match stream_request(
-            &app,
+            app.clone(),
             &provider,
             &api_messages,
             &tools,
@@ -1332,11 +1718,19 @@ pub async fn run_agent_turn(
                     ),
                     true,
                 )
+            } else if matches!(tool_name.as_str(), "subagent" | "subagent_report" | "list_agents" | "interrupt_agent") {
+                // ★ 子代理工具：由循环接管（需要 AgentState/Provider/AppHandle）
+                let args: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
+                match handle_agent_tools(app.clone(), cmd_registry, taskmaps, state, &conv_id, &work_dir, &provider, tool_name, &args).await {
+                    Ok(text) => (text, true),
+                    Err(e) => (format!("工具执行失败: {e}"), false),
+                }
             } else {
                 // 解析参数并执行
                 let args: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
                 match tools::execute_tool(tool_name, &args, &work_dir, db, cmd_registry, taskmaps, &conv_id).await {
-                    Ok(text) => (truncate_tool_result(&text), true),
+                    // ★ 超大结果落盘：历史里只留头尾预览 + 取回提示（DSH spill 思路）
+                    Ok(text) => (spill_tool_result(db, &conv_id, tool_name, &text), true),
                     Err(e) => (format!("工具执行失败: {e}"), false),
                 }
             };
@@ -1454,10 +1848,488 @@ pub async fn run_agent_turn(
     Ok(())
 }
 
+
+// ==================== 子代理（Subagent） ====================
+
+/// 子代理最大轮次上限（防止失控循环）
+const MAX_SUBAGENT_TURNS: u32 = 40;
+/// 子代理历史内存上限（字符；超出后保留任务指令 + 最近 30 条）
+const MAX_SUBAGENT_HISTORY_CHARS: usize = 300_000;
+/// 子代理最终总结上限（字符）
+const MAX_SUBAGENT_RESULT_CHARS: usize = 20_000;
+
+/// 技能目录文本（追加到 system 提示末尾；技能少且静态，不影响缓存前缀稳定性）
+fn skill_catalog_text(work_dir: &str) -> String {
+    let skills = tools::scan_skills(work_dir);
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n\n【可用技能】（项目 .canlow/skills/ 或 ~/.canlow/skills/；用 skill 工具加载完整内容）\n");
+    for (n, d) in skills {
+        s.push_str(&format!("- {n}：{d}\n"));
+    }
+    s
+}
+
+/// 子代理 system 提示：基础提示（无工程模式规则）+ 子代理指令 + 技能目录
+fn build_subagent_system_prompt(description: &str, work_dir: &str) -> String {
+    let mut p = build_system_prompt(false, None);
+    p.push_str(&format!(
+        "\n\n【子代理指令】你是主代理委派的子代理，负责：{description}。\n规则：\n"
+    ));
+    p.push_str("1. 你与主代理共享工作区（");
+    p.push_str(work_dir);
+    p.push_str("），所有路径为相对路径；\n");
+    p.push_str("2. 独立完成任务，尽量自包含，不要假设主代理会补充信息；\n");
+    p.push_str("3. 必要时可以用子代理工具继续向下委派（递归）；\n");
+    p.push_str("4. 完成后给出简洁的最终总结（结论、产出文件、遗留问题），不要复述过程。\n");
+    p.push_str("5. 如需技能，用 skill 工具（不带参数）查询可用技能列表后按需加载。");
+    p
+}
+
+/// 子代理历史裁剪：超限时保留任务指令 + 最近 30 条（内存内，不落库）
+fn trim_subagent_history(history: &mut Vec<ChatMessage>) {
+    let total: usize = history
+        .iter()
+        .map(|m| m.content.len() + m.reasoning_content.as_deref().unwrap_or("").len())
+        .sum();
+    if total <= MAX_SUBAGENT_HISTORY_CHARS {
+        return;
+    }
+    let head = history.first().cloned();
+    let tail_start = history.len().saturating_sub(30);
+    let mut kept: Vec<ChatMessage> = history[tail_start..].to_vec();
+    if let Some(h) = head {
+        if !kept.iter().any(|m| m.role == "user" && m.content == h.content) {
+            kept.insert(0, h);
+        }
+    }
+    *history = kept;
+}
+
+/// 子代理授权询问：路由到发起会话的 UI（convId = 发起会话），子代理自己持有等待表
+async fn ask_subagent_permission(
+    app: AppHandle,
+    entry: &SubagentEntry,
+    tool_name: &str,
+    desc: &str,
+) -> bool {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    entry
+        .pending_permissions
+        .lock()
+        .unwrap()
+        .insert(request_id.clone(), tx);
+    let _ = app.emit(
+        "permission-request",
+        PermissionRequest {
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            description: format!("（子代理「{}」请求）{desc}", entry.description),
+            conv_id: entry.parent_conv_id.clone(),
+        },
+    );
+    tokio::select! {
+        r = rx => r.unwrap_or(false),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+            entry.pending_permissions.lock().unwrap().remove(&request_id);
+            false
+        }
+    }
+}
+
+/// 子代理循环：独立上下文 + 共享工作区/工具集/授权策略。
+/// 不写主会话历史、不触发计划确认；权限弹窗与完成通知路由到发起会话。
+async fn run_subagent_loop(
+    app: AppHandle,
+    db: Arc<Db>,
+    cmd_registry: Arc<CmdRegistry>,
+    taskmaps: Arc<TaskMapStore>,
+    agent: Arc<AgentState>,
+    entry: Arc<SubagentEntry>,
+    work_dir: String,
+    provider: ProviderConfig,
+) -> String {
+    entry.running.store(true, Ordering::Relaxed);
+    let db_ref = db.as_ref();
+    let system = build_subagent_system_prompt(&entry.description, &work_dir);
+    let mut history: Vec<ChatMessage> = vec![ChatMessage::user(&entry.prompt)];
+    let mut turns: u32 = 0;
+    let mut last_text = String::new();
+
+    loop {
+        if entry.stop_flag.load(Ordering::Relaxed) {
+            let msg = format!("⏹ 子代理「{}」已被中断", entry.description);
+            entry.set_done(msg.clone());
+            return msg;
+        }
+        turns += 1;
+        entry.turn_count.store(turns, Ordering::Relaxed);
+        if turns > MAX_SUBAGENT_TURNS {
+            let msg = format!(
+                "⏹ 子代理「{}」达到 {} 轮上限，已停止。最后输出：\n{}",
+                entry.description,
+                MAX_SUBAGENT_TURNS,
+                last_text
+            );
+            entry.set_done(msg.clone());
+            return msg;
+        }
+        trim_subagent_history(&mut history);
+
+        let mut api_messages: Vec<ChatMessage> = Vec::with_capacity(history.len() + 1);
+        api_messages.push(ChatMessage {
+            role: "system".into(),
+            content: system.clone(),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+        api_messages.extend(history.iter().cloned());
+        fix_tool_sequence(&mut api_messages);
+        for m in api_messages.iter_mut() {
+            if m.role == "assistant" && m.content.trim().is_empty() && m.tool_calls.is_some() {
+                m.content = "[调用工具]".into();
+            }
+        }
+        let tools = tools::tool_definitions();
+
+        let (content, reasoning, tool_calls, _usage) = match stream_request(
+            app.clone(),
+            &provider,
+            &api_messages,
+            &tools,
+            &entry.stop_flag,
+            &entry.id,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("❌ 子代理「{}」请求失败：{e}", entry.description);
+                entry.set_done(msg.clone());
+                return msg;
+            }
+        };
+
+        let assistant_msg = ChatMessage {
+            role: "assistant".into(),
+            content,
+            reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) },
+            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
+            tool_call_id: None,
+            name: None,
+        };
+        if !assistant_msg.content.is_empty() {
+            last_text = assistant_msg.content.clone();
+        }
+        history.push(assistant_msg);
+
+        if tool_calls.is_empty() {
+            break;
+        }
+
+        let mut results: Vec<ChatMessage> = Vec::new();
+        let mut executed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tc in &tool_calls {
+            if entry.stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let tool_name = &tc.function.name;
+            let args_text = &tc.function.arguments;
+            let desc = format!("{tool_name} {args_text}");
+
+            let allowed = match agent.auth_mode.load(Ordering::Relaxed) {
+                AUTH_NONE | AUTH_ALLOW_ALL => true,
+                AUTH_SMART if is_safe_tool(tool_name) => true,
+                AUTH_SMART if tool_name == "run_command" => {
+                    let safe = serde_json::from_str::<Value>(args_text)
+                        .ok()
+                        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
+                        .map(|c| is_safe_command_text(&c))
+                        .unwrap_or(false);
+                    if safe {
+                        true
+                    } else {
+                        ask_subagent_permission(app.clone(), &entry, tool_name, &desc).await
+                    }
+                }
+                _ => ask_subagent_permission(app.clone(), &entry, tool_name, &desc).await,
+            };
+
+            let (result, ok): (String, bool) = if !allowed {
+                (format!("用户拒绝了该工具调用（{desc}）"), false)
+            } else {
+                let args: Value = serde_json::from_str(args_text).unwrap_or_else(|_| json!({}));
+                if tool_name == "get_context_remaining" {
+                    let used_chars: usize = api_messages.iter().map(|m| m.content.len()).sum();
+                    let used_tokens = used_chars / 3;
+                    (
+                        format!(
+                            "当前子代理上下文约使用 {} tokens（预算约 60k tokens），剩余约 {} tokens。",
+                            used_tokens,
+                            60_000usize.saturating_sub(used_tokens)
+                        ),
+                        true,
+                    )
+                } else if matches!(
+                    tool_name.as_str(),
+                    "subagent" | "subagent_report" | "list_agents" | "interrupt_agent"
+                ) {
+                    // Box::pin 打断与 handle_agent_tools 的互相异步递归
+                    match Box::pin(handle_agent_tools(
+                        app.clone(),
+                        &cmd_registry,
+                        &taskmaps,
+                        &agent,
+                        &entry.parent_conv_id,
+                        &work_dir,
+                        &provider,
+                        tool_name,
+                        &args,
+                    ))
+                    .await
+                    {
+                        Ok(text) => (text, true),
+                        Err(e) => (format!("工具执行失败: {e}"), false),
+                    }
+                } else {
+                    match tools::execute_tool(
+                        tool_name,
+                        &args,
+                        &work_dir,
+                        db_ref,
+                        &cmd_registry,
+                        &taskmaps,
+                        &entry.id,
+                    )
+                    .await
+                    {
+                        Ok(text) => (spill_tool_result(db_ref, &entry.id, tool_name, &text), true),
+                        Err(e) => (format!("工具执行失败: {e}"), false),
+                    }
+                }
+            };
+            let _ = ok;
+            results.push(ChatMessage::tool_result(&tc.id, tool_name, result));
+            executed.insert(tc.id.clone());
+        }
+        for tc in &tool_calls {
+            if !executed.contains(&tc.id) {
+                results.push(ChatMessage::tool_result(
+                    &tc.id,
+                    &tc.function.name,
+                    "（子代理被中断，该工具调用未执行）",
+                ));
+            }
+        }
+        history.extend(results);
+    }
+
+    let msg = format!(
+        "✅ 子代理「{}」完成（{} 轮）：\n{}",
+        entry.description,
+        turns,
+        last_text.chars().take(MAX_SUBAGENT_RESULT_CHARS).collect::<String>()
+    );
+    entry.set_done(msg.clone());
+    msg
+}
+
+/// 子代理工具派发：subagent / subagent_report / list_agents / interrupt_agent
+/// 主循环与子代理循环共用；后台任务持有 Arc 克隆，可安全 spawn。
+/// app 按值传入（&AppHandle 跨 await 不满足 Send）。
+async fn handle_agent_tools(
+    app: AppHandle,
+    cmd_registry: &Arc<CmdRegistry>,
+    taskmaps: &Arc<TaskMapStore>,
+    agent: &Arc<AgentState>,
+    conv_id: &str,
+    work_dir: &str,
+    provider: &ProviderConfig,
+    tool_name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match tool_name {
+        "subagent" => {
+            let description = get("description");
+            let prompt = get("prompt");
+            if description.trim().is_empty() {
+                return Err("缺少参数：description（3-5 字任务描述）".into());
+            }
+            if prompt.trim().is_empty() {
+                return Err("缺少参数：prompt（完整独立的任务提示词）".into());
+            }
+            let background = args
+                .get("run_in_background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let id = format!("sub-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let entry = Arc::new(SubagentEntry::new(
+                id.clone(),
+                description.clone(),
+                prompt.clone(),
+                conv_id.to_string(),
+            ));
+            agent
+                .subagents
+                .lock()
+                .unwrap()
+                .insert(id.clone(), entry.clone());
+
+            if background {
+                // ★ 后台子代理：独立线程 + current_thread runtime 的 block_on。
+                //   使 run_subagent_loop 的 future 无需满足 Send——
+                //   避免互相递归 async fn（run_subagent_loop ↔ handle_agent_tools）
+                //   形成无限 future 类型导致 Send 检查/类型计算死循环。
+                let app2 = app.clone();
+                let db2 = agent.db.clone();
+                let reg2 = cmd_registry.clone();
+                let tm2 = taskmaps.clone();
+                let ag2 = agent.clone();
+                let ent2 = entry.clone();
+                let wd = work_dir.to_string();
+                let prov = provider.clone();
+                let pc = conv_id.to_string();
+                let desc2 = description.clone();
+                let id2 = id.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("子代理运行时创建失败");
+                    let msg = rt.block_on(run_subagent_loop(
+                        app2.clone(),
+                        db2,
+                        reg2,
+                        tm2,
+                        ag2,
+                        ent2.clone(),
+                        wd,
+                        prov,
+                    ));
+                    let _ = app2.emit(
+                        "stream-notice",
+                        json!({
+                            "message": format!(
+                                "🤖 子代理「{desc2}」（{id2}）已完成：{}",
+                                msg.chars().take(200).collect::<String>()
+                            ),
+                            "convId": pc,
+                        }),
+                    );
+                });
+                Ok(format!(
+                    "🤖 已启动后台子代理「{description}」（id: {id}）。\n- 用 subagent_report 获取结果（subagent_id: {id}）\n- 用 list_agents 查看状态\n- 用 interrupt_agent 中断"
+                ))
+            } else {
+                // 前台：Box::pin 打断异步递归（run_subagent_loop ↔ handle_agent_tools）
+                // ——递归 async fn 必须 boxing；本链路无 Send 要求（后台走独立线程）
+                let msg = Box::pin(run_subagent_loop(
+                    app.clone(),
+                    agent.db.clone(),
+                    cmd_registry.clone(),
+                    taskmaps.clone(),
+                    agent.clone(),
+                    entry.clone(),
+                    work_dir.to_string(),
+                    provider.clone(),
+                ))
+                .await;
+                Ok(msg)
+            }
+        }
+        "subagent_report" => {
+            let id = get("subagent_id");
+            let subs = agent.subagents.lock().unwrap();
+            match subs.get(&id) {
+                Some(e) => {
+                    let running = e.running.load(Ordering::Relaxed);
+                    let result = e.result.lock().unwrap().clone();
+                    match result {
+                        Some(r) => Ok(format!("[子代理 {id}「{}」]\n{r}", e.description)),
+                        None if running => Ok(format!(
+                            "子代理 {id}「{}」仍在运行中（已 {} 轮）。稍后再试，或用 interrupt_agent 中断。",
+                            e.description,
+                            e.turn_count.load(Ordering::Relaxed)
+                        )),
+                        None => Ok(format!("子代理 {id}「{}」已结束但无结果。", e.description)),
+                    }
+                }
+                None => Err(format!("子代理不存在: {id}（可用 list_agents 查看全部）")),
+            }
+        }
+        "list_agents" => {
+            let subs = agent.subagents.lock().unwrap();
+            if subs.is_empty() {
+                return Ok("（当前没有子代理）".into());
+            }
+            let mut lines: Vec<String> = Vec::new();
+            for (id, e) in subs.iter() {
+                let status = if e.running.load(Ordering::Relaxed) {
+                    "运行中"
+                } else if e.result.lock().unwrap().is_some() {
+                    "已完成"
+                } else {
+                    "已结束"
+                };
+                lines.push(format!(
+                    "- {id}「{}」: {status}（{} 轮）",
+                    e.description,
+                    e.turn_count.load(Ordering::Relaxed)
+                ));
+            }
+            Ok(format!("子代理列表（{} 个）：\n{}", subs.len(), lines.join("\n")))
+        }
+        "interrupt_agent" => {
+            let id = get("agent_id");
+            let subs = agent.subagents.lock().unwrap();
+            match subs.get(&id) {
+                Some(e) => {
+                    e.stop_flag.store(true, Ordering::Relaxed);
+                    let mut pending = e.pending_permissions.lock().unwrap();
+                    for (_, tx) in pending.drain() {
+                        let _ = tx.send(false);
+                    }
+                    Ok(format!("已请求中断子代理 {id}「{}」", e.description))
+                }
+                None => Err(format!("子代理不存在: {id}（可用 list_agents 查看全部）")),
+            }
+        }
+        _ => Err(format!("未知子代理工具: {tool_name}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::types::ToolCall;
+
+    #[test]
+    fn minimal_system_prompt_is_one_sentence() {
+        let core = build_core_system_prompt();
+        // 一句话：不含规则块、技能目录、任务图评审
+        assert!(!core.contains("【工程模式】"), "工程规则应移出 system");
+        assert!(!core.contains("【工作纪律】"), "工作纪律应移出 system");
+        assert!(!core.contains("【可用技能】"), "技能目录应移出 system");
+        assert!(!core.contains("【当前任务图状态】"), "任务图评审应移出 system");
+        assert!(core.chars().count() < 80, "system 应为一句话（当前 {} 字符）", core.chars().count());
+    }
+
+    #[test]
+    fn work_rules_live_outside_system() {
+        let rules = build_work_rules_text();
+        assert!(rules.contains("【工作纪律】"));
+        assert!(rules.contains("【工程模式】"));
+        assert!(rules.contains("plan_init"));
+        assert!(rules.contains("任务编号"));
+        assert!(rules.contains("check_command"), "通用纪律应与工程规则一起注入");
+        // 规则作为请求第一条 user 消息注入时带标记
+        assert!(format!("{RULES_MARKER}\n{rules}").starts_with(RULES_MARKER));
+    }
 
     #[test]
     fn fix_missing_tool_results() {
@@ -1773,7 +2645,7 @@ mod archive_tests {
     #[test]
     fn compression_creates_snapshot_and_searchable_archive() {
         let db = test_db();
-        let conv = db.create_conversation("t", "", "", "", "high").unwrap();
+        let conv = db.create_conversation("t", "", "", "", "high", true).unwrap();
         // 造一条超长历史触发压缩
         let mut history = vec![
             ChatMessage::user("帮我分析 main.py 的性能问题"),
@@ -1792,7 +2664,10 @@ mod archive_tests {
         }
         db.append_messages(&conv.id, &history).unwrap();
         let loaded = db.load_messages(&conv.id).unwrap();
-        let compacted = compact_history_if_needed(&db, &conv.id, loaded).unwrap();
+        let compacted = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_history_if_needed(&db, &conv.id, loaded, None))
+            .unwrap();
         assert!(compacted.len() < history.len(), "应发生压缩");
         // 完整快照应已入库（可搜索）
         let hits = db.cache_search(&conv.id, "内存泄漏", 5).unwrap();
@@ -1807,7 +2682,10 @@ mod archive_tests {
         let before = db.setting_get("cache_count_probe").ok();
         let _ = before;
         let count_before = db.cache_search(&conv.id, "填充文本", 100).unwrap().len();
-        let again = compact_history_if_needed(&db, &conv.id, reloaded).unwrap();
+        let again = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_history_if_needed(&db, &conv.id, reloaded, None))
+            .unwrap();
         assert_eq!(again.len(), compacted.len(), "压缩视图不应再次被压缩");
         let count_after = db.cache_search(&conv.id, "填充文本", 100).unwrap().len();
         assert!(count_after >= count_before, "不应产生新的重复归档");
@@ -1939,7 +2817,7 @@ mod compact_sequence_tests {
     #[test]
     fn compact_keeps_tool_sequence_complete() {
         let db = test_db();
-        let conv = db.create_conversation("t", "", "", "", "256k").unwrap();
+        let conv = db.create_conversation("t", "", "", "", "256k", true).unwrap();
         let filler = "填充文本用于撑大上下文。".repeat(1500); // ~1.2 万字符
         let mut history = vec![ChatMessage::user("帮我做项目")];
         // 20 轮工具调用（assistant + 2 个 tool 结果），每轮末尾带大内容
@@ -1963,7 +2841,10 @@ mod compact_sequence_tests {
         let loaded = db.load_messages(&conv.id).unwrap();
         let total: usize = loaded.iter().map(|m| m.content.len()).sum();
         assert!(total > 360_000, "测试历史应超过压缩阈值: {total}");
-        let compacted = compact_history_if_needed(&db, &conv.id, loaded).unwrap();
+        let compacted = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(compact_history_if_needed(&db, &conv.id, loaded, None))
+            .unwrap();
         // 压缩后视图必须序列合法（含摘要 assistant 与保留消息）
         assert_sequence_valid(&compacted);
         // 压缩已持久化，重新加载也应合法

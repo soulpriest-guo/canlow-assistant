@@ -128,5 +128,6 @@ pub fn resolve_provider_config(
         },
         reasoning_effort: effort.map(String::from),
         thinking,
+        supports_thinking: def.supports_thinking,
     })
 }

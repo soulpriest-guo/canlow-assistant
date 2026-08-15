@@ -5,9 +5,8 @@
 //  3) 只有超出窗口上限才压缩；压缩时保留全部用户消息原文 + 摘要放最后
 import type { ChatMessage } from "../types";
 
-export const SYSTEM_PROMPT = `你是 Canlow，一个智能编程助手。
-你与用户共享一个工作区。保持对话简洁、直接，用中文回复。
-可以使用工具完成任务，但不要编造执行结果。`;
+// 与 Rust 侧 build_core_system_prompt() 保持一致：极简固定 system（DSH minimal 风格）
+export const SYSTEM_PROMPT = `你是 Canlow，一个智能编程助手。你与用户共享一个工作区。使用工具完成任务，不要编造执行结果。`;
 
 // 压缩后最多保留的用户消息预算（字符估算）
 const COMPACT_USER_CHARS = 50000;

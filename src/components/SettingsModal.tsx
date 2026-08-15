@@ -1,6 +1,6 @@
-// 设置弹窗：左侧设置项目导航 + 右侧内容面板
+// 设置弹窗：左侧设置项目导航 + 右侧内容面板（含技能管理）
 import { useEffect, useState } from "react";
-import { Database, Plus, RefreshCw, Server, Trash2, X } from "lucide-react";
+import { BookOpen, Database, FolderOpen, Plus, RefreshCw, Server, Sparkles, Trash2, X } from "lucide-react";
 import type { ProviderDef } from "../types";
 import {
   contextProfileGet,
@@ -12,17 +12,24 @@ import {
   providerSetModels,
   providerTest,
   providersList,
+  skillCreate,
+  skillOpenDir,
+  skillsList,
 } from "../lib/api";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   onProvidersChanged: () => void;
+  /** 当前会话工作目录（技能的项目级位置） */
+  workDir?: string;
+  /** 在对话中应用技能：发送使用指令 */
+  onUseSkill?: (name: string) => void;
 }
 
-type Section = "api" | "context";
+type Section = "api" | "context" | "skills";
 
-export default function SettingsModal({ open, onClose, onProvidersChanged }: Props) {
+export default function SettingsModal({ open, onClose, onProvidersChanged, workDir, onUseSkill }: Props) {
   const [section, setSection] = useState<Section>("api");
   const [providers, setProviders] = useState<ProviderDef[]>([]);
   const [selected, setSelected] = useState<string>("DeepSeek");
@@ -37,9 +44,16 @@ export default function SettingsModal({ open, onClose, onProvidersChanged }: Pro
   const [customName, setCustomName] = useState("");
   const [customUrl, setCustomUrl] = useState("");
   const [customModels, setCustomModels] = useState("");
+  // 技能管理
+  const [skills, setSkills] = useState<[string, string, string, string][]>([]);
+  const [newSkillName, setNewSkillName] = useState("");
+  const [newSkillDesc, setNewSkillDesc] = useState("");
+  const [newSkillContent, setNewSkillContent] = useState("");
+  const [skillMsg, setSkillMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
+      skillsList(workDir || "").then(setSkills).catch(() => {});
       contextProfileGet().then((p) => setContextProfile(p === "256k" ? "256k" : "1m")).catch(() => {});
       providersList().then((ps) => {
         setProviders(ps);
@@ -110,6 +124,12 @@ export default function SettingsModal({ open, onClose, onProvidersChanged }: Pro
               onClick={() => setSection("context")}
             >
               <Database size={14} /> 上下文长度
+            </button>
+            <button
+              className={"settings-nav-item" + (section === "skills" ? " active" : "")}
+              onClick={() => setSection("skills")}
+            >
+              <BookOpen size={14} /> 技能
             </button>
           </nav>
 
@@ -281,7 +301,7 @@ export default function SettingsModal({ open, onClose, onProvidersChanged }: Pro
                   )}
                 </div>
               </div>
-            ) : (
+            ) : section === "context" ? (
               <div className="context-section">
                 <div className="form-row">
                   <label>上下文档位</label>
@@ -308,7 +328,7 @@ export default function SettingsModal({ open, onClose, onProvidersChanged }: Pro
                   </div>
                   <div className="profile-row">
                     <span>压缩触发阈值</span>
-                    <span>240 万字符（~80 万 tokens）</span>
+                    <span>180 万字符（~60 万 tokens）</span>
                     <span>60 万字符（~20 万 tokens）</span>
                   </div>
                   <div className="profile-row">
@@ -322,9 +342,102 @@ export default function SettingsModal({ open, onClose, onProvidersChanged }: Pro
                     <span>15 万字符（~5 万 tokens）</span>
                   </div>
                   <div className="profile-row">
-                    <span>预算提醒</span>
-                    <span>210 万字符（85%）</span>
-                    <span>52 万字符（85%）</span>
+                    <span>上下文预算（AI 报告口径）</span>
+                    <span>180 万字符（~60 万 tokens）</span>
+                    <span>60 万字符（~20 万 tokens）</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="skills-section">
+                <div className="skills-toolbar">
+                  <button
+                    className="btn-ghost"
+                    onClick={async () => {
+                      try {
+                        const p = await skillOpenDir(workDir || "", "project");
+                        setSkillMsg("已打开项目技能目录：" + p);
+                      } catch (e) { setSkillMsg("❌ " + String(e)); }
+                    }}
+                  >
+                    <FolderOpen size={13} /> 打开项目技能目录
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    onClick={async () => {
+                      try {
+                        const p = await skillOpenDir(workDir || "", "user");
+                        setSkillMsg("已打开用户技能目录：" + p);
+                      } catch (e) { setSkillMsg("❌ " + String(e)); }
+                    }}
+                  >
+                    <FolderOpen size={13} /> 打开用户技能目录
+                  </button>
+                </div>
+                <p className="modal-hint">
+                  技能 = 一组指令文件（<code>.canlow/skills/&lt;名称&gt;/SKILL.md</code>，文件头用 <code>---</code> 标注 name/description）。
+                  AI 会自动知道可用技能；对话中说「使用技能 xxx」或点下方「应用」即可让它加载执行。
+                </p>
+                {skillMsg && <div className="test-result">{skillMsg}</div>}
+                <div className="skills-list">
+                  {skills.length === 0 && <p className="modal-hint">（暂无技能。可在下方新建，或在技能目录里手动放 SKILL.md 文件）</p>}
+                  {skills.map(([name, desc, source, path]) => (
+                    <div key={name} className="skill-item">
+                      <div className="skill-item-info">
+                        <span className="skill-item-name"><Sparkles size={12} /> {name}</span>
+                        <span className="skill-item-desc">{desc || "（无描述）"}</span>
+                        <span className="skill-item-path" title={path}>{source} · {path}</span>
+                      </div>
+                      <button
+                        className="btn-primary skill-item-use"
+                        title="关闭设置并向当前对话发送使用指令"
+                        onClick={() => {
+                          onUseSkill?.(name);
+                          onClose();
+                        }}
+                      >
+                        应用
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="skill-create">
+                  <div className="form-row">
+                    <label>新建技能</label>
+                  </div>
+                  <div className="form-row">
+                    <input value={newSkillName} onChange={(e) => setNewSkillName(e.target.value)} placeholder="技能名称（英文/数字/-_）" />
+                  </div>
+                  <div className="form-row">
+                    <input value={newSkillDesc} onChange={(e) => setNewSkillDesc(e.target.value)} placeholder="一句话描述（AI 判断何时使用）" />
+                  </div>
+                  <div className="form-row">
+                    <textarea
+                      className="skill-content-input"
+                      value={newSkillContent}
+                      onChange={(e) => setNewSkillContent(e.target.value)}
+                      placeholder={"技能指令正文：告诉 AI 何时使用、如何一步步执行、有什么注意事项。\n（留空会生成模板）"}
+                      rows={5}
+                    />
+                  </div>
+                  <div className="modal-actions">
+                    <button
+                      className="btn-primary"
+                      onClick={async () => {
+                        try {
+                          const p = await skillCreate(workDir || "", newSkillName, newSkillDesc, newSkillContent);
+                          setSkillMsg("✅ 技能已创建：" + p);
+                          setNewSkillName(""); setNewSkillDesc(""); setNewSkillContent("");
+                          const list = await skillsList(workDir || "");
+                          setSkills(list);
+                        } catch (e) { setSkillMsg("❌ " + String(e)); }
+                      }}
+                    >
+                      <Plus size={13} /> 创建技能
+                    </button>
+                    <span className="modal-hint">
+                      {workDir ? "写入项目目录（当前会话工作区）" : "未设置工作目录，写入用户目录 ~/.canlow/skills/"}
+                    </span>
                   </div>
                 </div>
               </div>

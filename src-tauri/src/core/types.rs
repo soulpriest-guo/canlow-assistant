@@ -72,6 +72,10 @@ pub struct ConversationMeta {
     pub model: String,
     pub reasoning_effort: String,
     pub engineering_mode: bool,
+    /// DeepSeek 适配模式：模仿 DSH llm-deepseek 适配器的请求纪律
+    /// （stream_options.include_usage、reasoning_content 仅工具轮回传、
+    /// 空工具输出占位、指数退避重试、缓存命中统计）
+    pub deepseek_mode: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -84,4 +88,7 @@ pub struct ProviderConfig {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub thinking: Option<bool>,
+    /// 提供商是否支持思考模式（reasoning_content 回传规则的依据）：
+    /// 支持者（DeepSeek/智谱/小米）只在工具轮回传；不支持者永不发送该字段
+    pub supports_thinking: bool,
 }

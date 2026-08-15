@@ -9,7 +9,9 @@ use super::db::Db;
 use super::safety::check_dangerous_command;
 use super::taskmap::{plan_dispatch, plan_tool_definitions, TaskMapStore};
 
-pub const MAX_READ_CHARS: usize = 500_000;
+/// 单次读文件上限：从 50 万字符降到 8 万（超大内容分 segment 读取；
+/// 结果若超过 3 万字符还会被 spill 落盘，历史里只留预览，避免每轮重复付费）
+pub const MAX_READ_CHARS: usize = 80_000;
 pub const MAX_CMD_OUTPUT: usize = 240_000;
 
 // ---------- 异步命令任务表 ----------
@@ -144,8 +146,8 @@ fn tool_read_file(base: &str, args: &Value) -> Result<String, String> {
         let full = safe_path(base, &paths[0])?;
         return read_text(&full);
     }
-    // 多文件：带分隔标题，总和限制 120k 字符
-    const MAX_TOTAL: usize = 120_000;
+    // 多文件：带分隔标题，总和限制 80k 字符（超出部分由 spill 落盘机制接管）
+    const MAX_TOTAL: usize = 80_000;
     let mut out = String::new();
     let mut total = 0;
     for p in &paths {
@@ -342,31 +344,76 @@ fn tool_delete_file(base: &str, args: &Value) -> Result<String, String> {
 
 // ---------- 搜索工具 ----------
 
-fn walk(base: &Path) -> Vec<PathBuf> {
+/// 搜索时默认跳过的噪音目录（生成物/依赖/版本控制，避免遍历几十万文件卡死）
+const NOISE_DIRS: &[&str] = &[
+    "node_modules", ".git", ".hg", ".svn", "dist", "build", "target", "out",
+    ".next", ".nuxt", ".output", "coverage", "__pycache__", ".venv", "venv",
+    ".idea", ".vscode", ".gradle", "Pods", ".tox", ".cache", ".pytest_cache",
+    "DerivedData", ".turbo", ".pnpm-store", "vendor", "third_party",
+];
+
+/// 单次搜索遍历的文件/目录上限（防止超大目录把搜索拖到分钟级）
+const MAX_WALK_FILES: usize = 30_000;
+
+
+
+/// 递归遍历目录树：跳过噪音目录（除非遍历起点本身就是它——显式指定则尊重），
+/// 带数量上限。返回 (路径列表, 是否截断)。
+fn walk(base: &Path, max: usize) -> (Vec<PathBuf>, bool) {
     let mut out = Vec::new();
+    let mut truncated = false;
     let mut stack = vec![base.to_path_buf()];
+    let root_noise = base
+        .file_name()
+        .map(|n| NOISE_DIRS.iter().any(|d| n == *d))
+        .unwrap_or(false);
     while let Some(dir) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p.clone());
-                }
-                out.push(p);
+        if out.len() >= max {
+            truncated = true;
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if out.len() >= max {
+                truncated = true;
+                break;
             }
+            // 用 DirEntry::file_type（readdir 自带 d_type，不再额外 stat）
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                if !root_noise {
+                    let name = e.file_name();
+                    if NOISE_DIRS.iter().any(|d| name == *d) {
+                        continue;
+                    }
+                }
+                stack.push(e.path());
+            }
+            out.push(e.path());
         }
     }
-    out
+    (out, truncated)
 }
 
 /// 搜索路径集合：path 为文件时只返回该文件；为目录时递归遍历
 /// （修复：grep/search/glob 的 path 传具体文件时无结果的问题）
-fn search_paths(base: &Path) -> Vec<PathBuf> {
+fn search_paths(base: &Path) -> (Vec<PathBuf>, bool) {
     if base.is_file() {
-        vec![base.to_path_buf()]
+        (vec![base.to_path_buf()], false)
     } else {
-        walk(base)
+        walk(base, MAX_WALK_FILES)
     }
+}
+
+/// 遍历截断提示（附在搜索结果尾部）
+fn walk_truncated_hint() -> String {
+    format!("
+
+⚠️ 目录过大，遍历已截断（仅扫描前 {MAX_WALK_FILES} 个文件/目录）；建议用 path 参数缩小范围")
 }
 
 fn tool_search_files(base: &str, args: &Value) -> Result<String, String> {
@@ -376,7 +423,8 @@ fn tool_search_files(base: &str, args: &Value) -> Result<String, String> {
     let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let pl = pattern.to_lowercase();
     let mut hits = Vec::new();
-    for p in search_paths(&dir) {
+    let (paths, truncated) = search_paths(&dir);
+    for p in &paths {
         if hits.len() >= max {
             break;
         }
@@ -385,11 +433,15 @@ fn tool_search_files(base: &str, args: &Value) -> Result<String, String> {
             hits.push(p.to_string_lossy().to_string());
         }
     }
-    Ok(if hits.is_empty() {
+    let mut out = if hits.is_empty() {
         "未找到匹配文件".to_string()
     } else {
         hits.join("\n")
-    })
+    };
+    if truncated {
+        out.push_str(&walk_truncated_hint());
+    }
+    Ok(out)
 }
 
 fn tool_grep_search(base: &str, args: &Value) -> Result<String, String> {
@@ -408,11 +460,36 @@ fn tool_grep_search(base: &str, args: &Value) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .collect();
     let mut hits: Vec<String> = Vec::new();
-    for p in search_paths(&dir) {
-        if p.is_dir() || hits.len() >= max {
+    let (paths, truncated) = search_paths(&dir);
+    // ★ 借鉴 rg --max-filesize 语义：超过阈值的大文件跳过，但统计并提示（默认 1MB，可调）
+    let max_file_bytes = args
+        .get("max_file_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .saturating_mul(1024 * 1024)
+        .max(64 * 1024); // 最小 64KB，防止误设过小
+    let mut skipped_count: usize = 0;
+    let mut skipped_samples: Vec<(String, u64)> = Vec::new();
+    for p in &paths {
+        if hits.len() >= max {
+            break;
+        }
+        // metadata 一次判断：目录跳过 / 大文件跳过（默认 >1MB 的内容搜索无意义且拖慢遍历）
+        let Ok(meta) = p.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
             continue;
         }
-        if let Ok(text) = read_text(&p) {
+        if meta.len() > max_file_bytes {
+            skipped_count += 1;
+            if skipped_samples.len() < 5 {
+                skipped_samples.push((p.display().to_string(), meta.len()));
+            }
+            continue;
+        }
+        // 直接读取（不走 read_text 的 80KB 限制），二进制文件 read_to_string 会失败自动跳过
+        if let Ok(text) = std::fs::read_to_string(p) {
             for (i, line) in text.lines().enumerate() {
                 if hits.len() >= max {
                     break;
@@ -424,11 +501,26 @@ fn tool_grep_search(base: &str, args: &Value) -> Result<String, String> {
             }
         }
     }
-    Ok(if hits.is_empty() {
+    let mut out = if hits.is_empty() {
         "未找到匹配行".to_string()
     } else {
         hits.join("\n")
-    })
+    };
+    if truncated {
+        out.push_str(&walk_truncated_hint());
+    }
+    if skipped_count > 0 {
+        let threshold_mb = max_file_bytes / (1024 * 1024);
+        let samples: Vec<String> = skipped_samples
+            .iter()
+            .map(|(p, sz)| format!("{p}（{}MB）", sz / (1024 * 1024)))
+            .collect();
+        out.push_str(&format!(
+            "\n\n⚠️ 已跳过 {skipped_count} 个大文件（> {threshold_mb}MB）：{}\n如需搜索大文件内容：用 max_file_size 调大阈值，或用 read_file_segment 分段读取后搜索。",
+            samples.join("、")
+        ));
+    }
+    Ok(out)
 }
 
 fn tool_glob_search(base: &str, args: &Value) -> Result<String, String> {
@@ -437,20 +529,25 @@ fn tool_glob_search(base: &str, args: &Value) -> Result<String, String> {
     let dir = safe_path(base, path)?;
     let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let mut hits = Vec::new();
-    for p in search_paths(&dir) {
+    let (paths, truncated) = search_paths(&dir);
+    for p in &paths {
         if hits.len() >= max {
             break;
         }
-        let rel = p.strip_prefix(&dir).unwrap_or(&p);
+        let rel = p.strip_prefix(&dir).unwrap_or(p);
         if glob_match(pattern, &rel.to_string_lossy()) {
             hits.push(p.to_string_lossy().to_string());
         }
     }
-    Ok(if hits.is_empty() {
+    let mut out = if hits.is_empty() {
         "未找到匹配文件".to_string()
     } else {
         hits.join("\n")
-    })
+    };
+    if truncated {
+        out.push_str(&walk_truncated_hint());
+    }
+    Ok(out)
 }
 
 /// 简易 glob（* 与 ** 支持）
@@ -722,9 +819,29 @@ pub async fn execute_tool(
         "create_directory" => tool_create_directory(base_dir, args),
         "get_file_info" => tool_get_file_info(base_dir, args),
         "delete_file" => tool_delete_file(base_dir, args),
-        "search_files" => tool_search_files(base_dir, args),
-        "grep_search" => tool_grep_search(base_dir, args),
-        "glob_search" => tool_glob_search(base_dir, args),
+        // ★ 目录遍历型搜索走 spawn_blocking：避免同步 std::fs 遍历阻塞 tokio 运行时
+        //   （大目录搜索期间 UI 卡在“等待模型响应”的根因）
+        "search_files" => {
+            let base = base_dir.to_string();
+            let a = args.clone();
+            tokio::task::spawn_blocking(move || tool_search_files(&base, &a))
+                .await
+                .map_err(|e| format!("搜索线程异常: {e}"))?
+        }
+        "grep_search" => {
+            let base = base_dir.to_string();
+            let a = args.clone();
+            tokio::task::spawn_blocking(move || tool_grep_search(&base, &a))
+                .await
+                .map_err(|e| format!("搜索线程异常: {e}"))?
+        }
+        "glob_search" => {
+            let base = base_dir.to_string();
+            let a = args.clone();
+            tokio::task::spawn_blocking(move || tool_glob_search(&base, &a))
+                .await
+                .map_err(|e| format!("搜索线程异常: {e}"))?
+        }
         "git_status" => tool_git_status(base_dir, args).await,
         "git_diff" => tool_git_diff(base_dir, args).await,
         "git_log" => tool_git_log(base_dir, args).await,
@@ -795,37 +912,60 @@ pub async fn execute_tool(
         "get_context_remaining" => {
             Ok("该工具仅在 agent 会话循环内可用，将返回当前上下文使用量与剩余空间。".into())
         }
+        // 子代理工具：agent 循环内特判（见 agent.rs），此处兜底
+        "subagent" | "subagent_report" | "list_agents" | "interrupt_agent" => {
+            Ok("该工具仅在 agent 会话循环内可用（由循环接管执行）。".into())
+        }
+        "skill" => tool_skill(base_dir, args),
         "fetch_webpage" => fetch_webpage(base_dir, args).await,
-        "search_web" => tool_search_web(db, args).await,
+        "search_web" => tool_search_web(db, conv_id, args).await,
         _ => Err(format!("未知工具: {name}")),
     }
 }
 
 // ---------- 扩展工具实现 ----------
 
-/// 联网搜索：调用 DeepSeek /responses 的原生 web_search 工具
-/// （与 Codex 使用 deepseek-v4-flash 时同款路线，搜索结果质量远高于自抓搜索引擎）
-async fn tool_search_web(db: &Db, args: &Value) -> Result<String, String> {
-    let query = args.get("query").and_then(|v| v.as_str()).ok_or("缺少 query")?;
-    let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+/// 联网搜索（优化版）：
+/// - 同会话同关键词 30 分钟内直接返回缓存结果（0 延迟、0 token）
+/// - 优先 DeepSeek /responses 原生 web_search（结果质量最高）
+/// - 保底为三引擎并行抓取（Bing/DDG/百度同时请求，第一个成功即返回）
+/// - 输出统一压缩到 SEARCH_OUTPUT_CAP_CHARS 以内，避免大结果在历史里每轮重复付费
+const SEARCH_OUTPUT_CAP_CHARS: usize = 5_000;
+const SEARCH_CACHE_MAX_AGE_MS: i64 = 30 * 60 * 1000;
+
+async fn tool_search_web(db: &Db, conv_id: &str, args: &Value) -> Result<String, String> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("缺少 query")?
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Err("缺少 query".into());
+    }
+    let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(5).min(10) as usize;
+    let cache_key = format!("websearch:{query}");
+
+    // 0) 缓存命中：同会话重复搜索直接返回（省时省 token）
+    if let Some(cached) = db.cache_find_by_summary(conv_id, &cache_key, SEARCH_CACHE_MAX_AGE_MS)? {
+        return Ok(format!(
+            "🔍 联网搜索结果（缓存命中，30 分钟内的同关键词结果，如需最新请换关键词）：\n{cached}"
+        ));
+    }
 
     // 1) 优先：DeepSeek 原生 web_search（模型级搜索，质量最高）
-    match native_search(db, query).await {
+    match native_search(db, &query).await {
         Ok(text) => {
-            let mut out = format!("🔍 联网搜索结果（原生搜索）：\n{text}");
-            if out.chars().count() > 12_000 {
-                out = out.chars().take(12_000).collect::<String>() + "\n...（结果已截断）";
-            }
+            let out = finalize_search_output(format!("🔍 联网搜索结果（原生搜索）：\n{text}"));
+            let _ = db.cache_add(conv_id, &cache_key, &out);
             return Ok(out);
         }
         Err(native_err) => {
-            // 2) 保底：抓取搜索引擎（结构化解析标题+链接+摘要）
-            match scrape_search(query, max_results).await {
+            // 2) 保底：三引擎并行抓取（结构化解析标题+链接+摘要）
+            match scrape_search(&query, max_results).await {
                 Ok(text) => {
-                    let mut out = format!("🔍 搜索结果（抓取保底）：\n{text}");
-                    if out.chars().count() > 12_000 {
-                        out = out.chars().take(12_000).collect::<String>() + "\n...（结果已截断）";
-                    }
+                    let out = finalize_search_output(format!("🔍 搜索结果（抓取保底）：\n{text}"));
+                    let _ = db.cache_add(conv_id, &cache_key, &out);
                     return Ok(out);
                 }
                 Err(scrape_err) => {
@@ -836,6 +976,20 @@ async fn tool_search_web(db: &Db, args: &Value) -> Result<String, String> {
             }
         }
     }
+}
+
+/// 搜索结果统一压缩：超长截断并提示
+fn cap_search_output(mut out: String) -> String {
+    if out.chars().count() > SEARCH_OUTPUT_CAP_CHARS {
+        out = out.chars().take(SEARCH_OUTPUT_CAP_CHARS).collect::<String>() + "\n...（结果已截断）";
+    }
+    out
+}
+
+/// 搜索输出定稿：压缩 + 引用来源提醒（对齐 DSH 的 cite-your-sources 纪律）
+fn finalize_search_output(out: String) -> String {
+    let capped = cap_search_output(out);
+    format!("{capped}\n\n请在回答中以 Markdown 链接格式引用上述来源 URL（如 [标题](链接)）。")
 }
 
 /// 原生搜索：DeepSeek /responses 的 web_search 工具（Codex 同款路线）
@@ -852,15 +1006,16 @@ async fn native_search(db: &Db, query: &str) -> Result<String, String> {
         .ok_or("未配置 DeepSeek API Key（将自动降级为网页抓取搜索）")?;
 
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
 
+    // max_output_tokens 收紧到 400：搜索回答只需要点，避免额外 token 浪费
     let payload = serde_json::json!({
         "model": "deepseek-v4-flash",
         "input": query,
-        "max_output_tokens": 800,
+        "max_output_tokens": 400,
         "tools": [{"type": "web_search"}],
         "store": false,
     });
@@ -894,42 +1049,58 @@ async fn scrape_search(query: &str, max_results: usize) -> Result<String, String
     let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
     let q = urlencode(query);
 
-    // Bing
-    let bing_url = format!("https://www.bing.com/search?q={q}&setlang=zh-hans");
-    if let Ok(resp) = client.get(&bing_url).header("User-Agent", ua).header("Accept-Language", "zh-CN,zh;q=0.9").send().await {
-        if resp.status().is_success() {
-            if let Ok(html) = resp.text().await {
-                if let Some(results) = parse_bing(&html, max_results) {
-                    return Ok(results);
-                }
-            }
+    // ★ 三引擎并行抓取（Bing/DDG/百度同时请求，第一个成功即返回）：
+    //   串行最坏 45s+ → 并行最坏 ~15s
+    let bing = async {
+        let url = format!("https://www.bing.com/search?q={q}&setlang=zh-hans");
+        let resp = client
+            .get(&url)
+            .header("User-Agent", ua)
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
-    }
-
-    // DuckDuckGo
-    let ddg_url = format!("https://html.duckduckgo.com/html/?q={q}");
-    if let Ok(resp) = client.get(&ddg_url).header("User-Agent", ua).send().await {
-        if resp.status().is_success() {
-            if let Ok(html) = resp.text().await {
-                if let Some(results) = parse_ddg(&html, max_results) {
-                    return Ok(results);
-                }
-            }
+        let html = resp.text().await.ok()?;
+        parse_bing(&html, max_results)
+    };
+    let ddg = async {
+        let url = format!("https://html.duckduckgo.com/html/?q={q}");
+        let resp = client.get(&url).header("User-Agent", ua).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
-    }
-
-    // Baidu
-    let baidu_url = format!("https://www.baidu.com/s?wd={q}");
-    if let Ok(resp) = client.get(&baidu_url).header("User-Agent", ua).header("Accept-Language", "zh-CN,zh;q=0.9").send().await {
-        if resp.status().is_success() {
-            if let Ok(html) = resp.text().await {
-                if let Some(results) = parse_baidu(&html, max_results) {
-                    return Ok(results);
-                }
-            }
+        let html = resp.text().await.ok()?;
+        parse_ddg(&html, max_results)
+    };
+    let baidu = async {
+        let url = format!("https://www.baidu.com/s?wd={q}");
+        let resp = client
+            .get(&url)
+            .header("User-Agent", ua)
+            .header("Accept-Language", "zh-CN,zh;q=0.9")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
-    }
+        let html = resp.text().await.ok()?;
+        parse_baidu(&html, max_results)
+    };
 
+    let (b, d, bd) = tokio::join!(bing, ddg, baidu);
+    if let Some(r) = b {
+        return Ok(r);
+    }
+    if let Some(r) = d {
+        return Ok(r);
+    }
+    if let Some(r) = bd {
+        return Ok(r);
+    }
     Err("所有搜索引擎均无法访问或解析失败，请检查网络".into())
 }
 
@@ -1031,7 +1202,8 @@ fn first_snippet(block: &str) -> Option<String> {
             let after = &block[pos..];
             if let Some(gt) = after.find('>') {
                 let text = strip_tags(&after[gt + 1..]);
-                let text = text.chars().take(300).collect::<String>();
+                // ★ 摘要收紧到 200 字符：5 条结果 × 200 ≈ 1k 字符，够模型判断相关性
+                let text = text.chars().take(200).collect::<String>();
                 if !text.is_empty() {
                     return Some(text);
                 }
@@ -1054,7 +1226,9 @@ fn parse_bing(html: &str, max: usize) -> Option<String> {
         let href = first_href(block).map(|u| decode_bing_url(&u)).unwrap_or_default();
         let snippet = first_snippet(block).unwrap_or_default();
         if !title.is_empty() || !href.is_empty() {
-            out.push(format!("{}. {}\n   {}\n   {}", out.len() + 1, title, href, snippet));
+            // ★ 尽力提取发布日期（如 2024-05-12），帮助模型判断时效性
+            let date = detect_date(&snippet).map(|d| format!("（{d}）")).unwrap_or_default();
+            out.push(format!("{}. {}{date}\n   {}\n   {}", out.len() + 1, title, href, snippet));
         }
         rest = &rest[block_end..];
         if block_end >= rest.len() {
@@ -1077,7 +1251,8 @@ fn parse_ddg(html: &str, max: usize) -> Option<String> {
         let href = first_href(block).map(|u| decode_ddg_url(&u)).unwrap_or_default();
         let snippet = first_snippet(block).unwrap_or_default();
         if !title.is_empty() || !href.is_empty() {
-            out.push(format!("{}. {}\n   {}\n   {}", out.len() + 1, title, href, snippet));
+            let date = detect_date(&snippet).map(|d| format!("（{d}）")).unwrap_or_default();
+            out.push(format!("{}. {}{date}\n   {}\n   {}", out.len() + 1, title, href, snippet));
         }
         rest = &rest[block_end..];
         if block_end >= rest.len() {
@@ -1100,7 +1275,8 @@ fn parse_baidu(html: &str, max: usize) -> Option<String> {
         let href = first_href(block).unwrap_or_default();
         let snippet = first_snippet(block).unwrap_or_default();
         if !title.is_empty() {
-            out.push(format!("{}. {}\n   {}\n   {}", out.len() + 1, title, href, snippet));
+            let date = detect_date(&snippet).map(|d| format!("（{d}）")).unwrap_or_default();
+            out.push(format!("{}. {}{date}\n   {}\n   {}", out.len() + 1, title, href, snippet));
         }
         rest = &rest[block_end..];
         if block_end >= rest.len() {
@@ -1232,7 +1408,7 @@ async fn fetch_webpage(base: &str, args: &Value) -> Result<String, String> {
     let url = args.get("url").and_then(|v| v.as_str()).ok_or("缺少 url")?;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(25))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
@@ -1244,11 +1420,17 @@ async fn fetch_webpage(base: &str, args: &Value) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
+    // ★ 响应体上限防护：>8MB 直接拒绝，避免下载巨型页面浪费时间与带宽
+    if let Some(len) = resp.content_length() {
+        if len > 8 * 1024 * 1024 {
+            return Err(format!("页面过大（{len} 字节），已拒绝下载"));
+        }
+    }
     let text = resp.text().await.map_err(|e| e.to_string())?;
-    // 简易正文提取
+    // 正文提取：HTML → Markdown（保留链接/列表/代码块/表格结构，对齐 DSH 的 turndown 方案）
     let title = extract_tag(&text, "title").unwrap_or_default();
-    let body = strip_tags(&text);
-    let body = body.trim().chars().take(3000).collect::<String>();
+    let body = html_to_markdown(&text);
+    let body = body.chars().take(3000).collect::<String>();
     let _ = base;
     Ok(format!("标题: {title}\n\n{body}"))
 }
@@ -1322,6 +1504,645 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 简易 HTML → Markdown 转换（零依赖；思路对齐 DSH 的 turndown）
+/// 支持：标题/段落/链接/列表/代码块/表格/强调/图片/引用/分隔线；
+/// script/style/noscript 内容丢弃；注释跳过；文本空白折叠。
+enum HtTok {
+    Text(String),
+    Open { name: String, attrs: Vec<(String, String)> },
+    Close(String),
+}
+
+fn html_tokenize(html: &str) -> Vec<HtTok> {
+    let chars: Vec<char> = html.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let n = chars.len();
+    let mut toks: Vec<HtTok> = Vec::new();
+    let mut text = String::new();
+    let mut i = 0usize;
+    let flush = |text: &mut String, toks: &mut Vec<HtTok>| {
+        if !text.is_empty() {
+            toks.push(HtTok::Text(std::mem::take(text)));
+        }
+    };
+    while i < n {
+        if chars[i] != '<' {
+            text.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 注释 <!-- ... -->：整段跳过
+        if lower[i..].starts_with(&['<', '!', '-', '-']) {
+            flush(&mut text, &mut toks);
+            let mut j = i + 4;
+            while j + 2 < n && !(lower[j] == '-' && lower[j + 1] == '-' && lower[j + 2] == '>') {
+                j += 1;
+            }
+            i = (j + 3).min(n);
+            continue;
+        }
+        // 结束标签 </name>
+        if i + 1 < n && lower[i + 1] == '/' {
+            let mut j = i + 2;
+            let mut name = String::new();
+            while j < n && lower[j].is_ascii_alphanumeric() {
+                name.push(lower[j]);
+                j += 1;
+            }
+            flush(&mut text, &mut toks);
+            toks.push(HtTok::Close(name));
+            while j < n && chars[j] != '>' {
+                j += 1;
+            }
+            i = (j + 1).min(n);
+            continue;
+        }
+        // 开始标签 <name attrs>
+        let mut j = i + 1;
+        let mut name = String::new();
+        while j < n && lower[j].is_ascii_alphanumeric() {
+            name.push(lower[j]);
+            j += 1;
+        }
+        if name.is_empty() {
+            text.push('<');
+            i += 1;
+            continue;
+        }
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        while j < n && chars[j] != '>' {
+            while j < n && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < n && (chars[j] == '>' || chars[j] == '/') {
+                if chars[j] == '/' {
+                    j += 1;
+                }
+                break;
+            }
+            let mut an = String::new();
+            while j < n && (lower[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_' || chars[j] == ':') {
+                an.push(lower[j]);
+                j += 1;
+            }
+            let mut k = j;
+            while k < n && chars[k].is_whitespace() {
+                k += 1;
+            }
+            let mut av = String::new();
+            if k < n && chars[k] == '=' {
+                k += 1;
+                while k < n && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                let quote = if k < n && (chars[k] == '"' || chars[k] == '\'') {
+                    let q = chars[k];
+                    k += 1;
+                    Some(q)
+                } else {
+                    None
+                };
+                while k < n {
+                    if let Some(q) = quote {
+                        if chars[k] == q {
+                            break;
+                        }
+                    } else if chars[k].is_whitespace() || chars[k] == '>' {
+                        break;
+                    }
+                    av.push(chars[k]);
+                    k += 1;
+                }
+                if quote.is_some() && k < n {
+                    k += 1;
+                }
+                j = k;
+            } else {
+                j = k;
+            }
+            if !an.is_empty() {
+                attrs.push((an, av));
+            }
+        }
+        flush(&mut text, &mut toks);
+        if j < n {
+            j += 1;
+        }
+        toks.push(HtTok::Open { name, attrs });
+        i = j.min(n);
+    }
+    flush(&mut text, &mut toks);
+    toks
+}
+
+fn html_attr(attrs: &[(String, String)], key: &str) -> Option<String> {
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+fn md_push_text(out: &mut String, s: &str) {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return;
+    }
+    let ends_mark = out.ends_with(['[', '(', '!', '*', '`']);
+    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') && !ends_mark {
+        out.push(' ');
+    }
+    out.push_str(&collapsed);
+}
+
+fn md_ensure_break(out: &mut String) {
+    while out.ends_with([' ', '\t', '\n']) {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+}
+
+fn html_to_markdown(html: &str) -> String {
+    let toks = html_tokenize(html);
+    let mut out = String::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut lists: Vec<(char, usize)> = Vec::new();
+    let mut cell: Option<String> = None;
+    let mut row: Vec<String> = Vec::new();
+    let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
+    let mut thead = false;
+    let mut in_pre = false;
+    // script/style/noscript 内部文本一律跳过（含嵌套）
+    let mut skip_depth = 0usize;
+    let is_block = |name: &str| -> bool {
+        matches!(name, "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav" | "aside" | "blockquote" | "figure" | "figcaption" | "details" | "summary" | "form" | "li" | "ul" | "ol" | "table" | "tr" | "thead" | "tbody" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "hr")
+    };
+    let is_void = |name: &str| -> bool {
+        matches!(name, "br" | "hr" | "img" | "input" | "meta" | "link" | "source" | "wbr")
+    };
+    for tok in toks {
+        match tok {
+            HtTok::Text(t) => {
+                if skip_depth > 0 {
+                    continue;
+                }
+                if in_pre {
+                    out.push_str(&t);
+                    continue;
+                }
+                if let Some(buf) = &mut cell {
+                    md_push_text(buf, &t);
+                    continue;
+                }
+                md_push_text(&mut out, &t);
+            }
+            HtTok::Open { name, attrs } => {
+                match name.as_str() {
+                    "script" | "style" | "noscript" => {
+                        skip_depth += 1;
+                        stack.push(name.clone());
+                    }
+                    "pre" => {
+                        md_ensure_break(&mut out);
+                        out.push_str("```\n");
+                        in_pre = true;
+                        stack.push(name.clone());
+                    }
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                        md_ensure_break(&mut out);
+                        let lvl: usize = name.chars().nth(1).and_then(|c| c.to_digit(10)).unwrap_or(1) as usize;
+                        out.push_str(&"#".repeat(lvl));
+                        out.push(' ');
+                        stack.push(name.clone());
+                    }
+                    "blockquote" => {
+                        md_ensure_break(&mut out);
+                        out.push_str("> ");
+                        stack.push(name.clone());
+                    }
+                    "hr" => {
+                        md_ensure_break(&mut out);
+                        out.push_str("---");
+                        md_ensure_break(&mut out);
+                    }
+                    "ul" | "ol" | "u" => {
+                        lists.push((if name == "ol" { 'o' } else { 'u' }, 0));
+                        md_ensure_break(&mut out);
+                        stack.push(name.clone());
+                    }
+                    "li" => {
+                        md_ensure_break(&mut out);
+                        let indent = "  ".repeat(lists.len().saturating_sub(1));
+                        let prefix = match lists.last_mut() {
+                            Some((kind, cnt)) => {
+                                *cnt += 1;
+                                if *kind == 'o' { format!("{cnt}. ") } else { "- ".to_string() }
+                            }
+                            None => "- ".to_string(),
+                        };
+                        out.push_str(&indent);
+                        out.push_str(&prefix);
+                        stack.push(name.clone());
+                    }
+                    "a" => {
+                        let href = html_attr(&attrs, "href").unwrap_or_default();
+                        out.push('[');
+                        stack.push(format!("a:{href}"));
+                    }
+                    "strong" | "b" => {
+                        out.push_str("**");
+                        stack.push(name.clone());
+                    }
+                    "em" | "i" => {
+                        out.push('*');
+                        stack.push(name.clone());
+                    }
+                    "code" => {
+                        if !in_pre {
+                            out.push('`');
+                        }
+                        stack.push(name.clone());
+                    }
+                    "img" => {
+                        let src = html_attr(&attrs, "src").unwrap_or_default();
+                        let alt = html_attr(&attrs, "alt").unwrap_or_default();
+                        if !src.is_empty() {
+                            out.push_str(&format!("![{alt}]({src})"));
+                        }
+                    }
+                    "table" => {
+                        rows.clear();
+                        md_ensure_break(&mut out);
+                        stack.push(name.clone());
+                    }
+                    "thead" => {
+                        thead = true;
+                        stack.push(name.clone());
+                    }
+                    "tbody" | "tfoot" => {
+                        stack.push(name.clone());
+                    }
+                    "tr" => {
+                        row.clear();
+                        stack.push(name.clone());
+                    }
+                    "td" | "th" => {
+                        cell = Some(String::new());
+                        stack.push(name.clone());
+                    }
+                    _ if is_block(&name) => {
+                        md_ensure_break(&mut out);
+                        stack.push(name.clone());
+                    }
+                    _ => {
+                        if !is_void(&name) {
+                            stack.push(name.clone());
+                        }
+                    }
+                }
+            }
+            HtTok::Close(name) => {
+                match name.as_str() {
+                    "pre" => {
+                        in_pre = false;
+                        out.push_str("\n```");
+                        md_ensure_break(&mut out);
+                        stack.pop();
+                    }
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
+                        md_ensure_break(&mut out);
+                        stack.pop();
+                    }
+                    "ul" | "ol" | "u" => {
+                        lists.pop();
+                        md_ensure_break(&mut out);
+                        stack.pop();
+                    }
+                    "li" => {
+                        out.push('\n');
+                        stack.pop();
+                    }
+                    "a" => {
+                        if let Some(top) = stack.pop() {
+                            if let Some(href) = top.strip_prefix("a:") {
+                                out.push_str(&format!("]({href})"));
+                            }
+                        }
+                    }
+                    "strong" | "b" => {
+                        out.push_str("**");
+                        stack.pop();
+                    }
+                    "em" | "i" => {
+                        out.push('*');
+                        stack.pop();
+                    }
+                    "code" => {
+                        if !in_pre {
+                            out.push('`');
+                        }
+                        stack.pop();
+                    }
+                    "td" | "th" => {
+                        if let Some(buf) = cell.take() {
+                            row.push(buf);
+                        }
+                        stack.pop();
+                    }
+                    "tr" => {
+                        rows.push((thead, std::mem::take(&mut row)));
+                        stack.pop();
+                    }
+                    "table" => {
+                        for (is_header, cells) in &rows {
+                            let line = format!("| {} |", cells.iter().map(|c| c.replace('|', "\\|")).collect::<Vec<_>>().join(" | "));
+                            out.push_str(&line);
+                            out.push('\n');
+                            if *is_header {
+                                out.push('|');
+                                for _ in cells {
+                                    out.push_str(" --- |");
+                                }
+                                out.push('\n');
+                            }
+                        }
+                        md_ensure_break(&mut out);
+                        stack.pop();
+                    }
+                    "thead" => {
+                        thead = false;
+                        stack.pop();
+                    }
+                    "tbody" | "tfoot" | "script" | "style" | "noscript" => {
+                        if matches!(name.as_str(), "script" | "style" | "noscript") {
+                            skip_depth = skip_depth.saturating_sub(1);
+                        }
+                        stack.pop();
+                    }
+                    _ if is_block(&name) => {
+                        md_ensure_break(&mut out);
+                        stack.pop();
+                    }
+                    _ => {
+                        stack.pop();
+                    }
+                }
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 尽力从文本中提取日期（YYYY-MM-DD / YYYY/M/D / YYYY年M月D日），用于搜索结果展示
+fn detect_date(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let read_num = |chars: &[char], start: usize| -> (usize, Option<u32>) {
+        let mut j = start;
+        let mut v: u32 = 0;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            v = v * 10 + (chars[j] as u32 - '0' as u32);
+            j += 1;
+        }
+        if j == start { (0, None) } else { (j - start, Some(v)) }
+    };
+    let valid = |y: u32, m: u32, d: u32| y >= 2000 && y <= 2035 && (1..=12).contains(&m) && (1..=31).contains(&d);
+    let mut i = 0usize;
+    while i + 3 < n {
+        if chars[i..i + 4].iter().all(|c| c.is_ascii_digit()) {
+            let y: u32 = chars[i..i + 4].iter().collect::<String>().parse().unwrap_or(0);
+            if let Some(sep) = chars.get(i + 4).copied() {
+                if sep == '-' || sep == '/' {
+                    let (mlen, m) = read_num(&chars, i + 5);
+                    if let (Some(mv), Some(sep2)) = (m, chars.get(i + 5 + mlen).copied()) {
+                        if sep2 == sep {
+                            let (_, d) = read_num(&chars, i + 5 + mlen + 1);
+                            if let Some(dv) = d {
+                                if valid(y, mv, dv) {
+                                    return Some(format!("{y}-{mv:02}-{dv:02}"));
+                                }
+                            }
+                        }
+                    }
+                } else if sep == '年' {
+                    let (mlen, m) = read_num(&chars, i + 5);
+                    if let (Some(mv), Some(_)) = (m, chars.get(i + 5 + mlen).copied()) {
+                        if chars.get(i + 5 + mlen) == Some(&'月') {
+                            let (dlen, d) = read_num(&chars, i + 5 + mlen + 1);
+                            if let (Some(dv), Some(_)) = (d, chars.get(i + 5 + mlen + 1 + dlen).copied()) {
+                                if chars.get(i + 5 + mlen + 1 + dlen) == Some(&'日') && valid(y, mv, dv) {
+                                    return Some(format!("{y}年{mv}月{dv}日"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---------- 技能系统（Skill） ----------
+/// 项目级技能目录（相对工作区）
+const PROJECT_SKILLS_DIR: &str = ".canlow/skills";
+
+/// 解析极简 frontmatter（--- 开头，name/description 键值），返回 (元数据, 正文)
+fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let fm = &rest[..end];
+            let body = rest[end + 4..].trim_start().to_string();
+            let mut map = HashMap::new();
+            for line in fm.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    map.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+                }
+            }
+            return (map, body);
+        }
+    }
+    (HashMap::new(), content.trim_start().to_string())
+}
+
+/// 收集一个技能目录下的技能（<dir>/<name>/SKILL.md 或 <dir>/<name>.md）
+fn collect_skills_from_dir(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().to_string();
+        let skill_path = if path.is_dir() {
+            path.join("SKILL.md")
+        } else if fname.ends_with(".md") {
+            path
+        } else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(&skill_path) else {
+            continue;
+        };
+        let (meta, _body) = parse_frontmatter(&content);
+        let base_name = fname.trim_end_matches(".md").to_string();
+        let name = meta.get("name").cloned().unwrap_or(base_name);
+        let desc = meta
+            .get("description")
+            .cloned()
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
+        out.push((name, desc));
+    }
+}
+
+/// 技能详情（供设置面板展示）：(名称, 描述, 来源标签, 绝对路径)
+pub fn skill_infos(work_dir: &str) -> Vec<(String, String, String, String)> {
+    let mut out: Vec<(String, String, String, String)> = Vec::new();
+    let collect = |dir: &std::path::Path, source: &str, out: &mut Vec<(String, String, String, String)>| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let skill_path = if path.is_dir() {
+                path.join("SKILL.md")
+            } else if fname.ends_with(".md") {
+                path
+            } else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&skill_path) else {
+                continue;
+            };
+            let (meta, _body) = parse_frontmatter(&content);
+            let base_name = fname.trim_end_matches(".md").to_string();
+            let name = meta.get("name").cloned().unwrap_or(base_name);
+            let desc = meta
+                .get("description")
+                .cloned()
+                .unwrap_or_default()
+                .chars()
+                .take(120)
+                .collect();
+            out.push((name, desc, source.to_string(), skill_path.to_string_lossy().to_string()));
+        }
+    };
+    collect(&std::path::Path::new(work_dir).join(PROJECT_SKILLS_DIR), "项目", &mut out);
+    if let Some(home) = dirs::home_dir() {
+        collect(&home.join(".canlow").join("skills"), "用户", &mut out);
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|(n, _, _, _)| seen.insert(n.clone()));
+    out
+}
+
+/// 技能目录路径：(项目级, 用户级)
+pub fn skill_dirs(work_dir: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let proj = std::path::Path::new(work_dir).join(PROJECT_SKILLS_DIR);
+    let user = dirs::home_dir()
+        .map(|h| h.join(".canlow").join("skills"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".canlow-skills"));
+    (proj, user)
+}
+
+/// 创建技能：写入 <dir>/<name>/SKILL.md（带 frontmatter）。dir 不存在时自动创建。
+pub fn skill_create(dir: &std::path::Path, name: &str, description: &str, content: &str) -> Result<String, String> {
+    let name_clean = name.trim().trim_matches('/');
+    if name_clean.is_empty() {
+        return Err("技能名称不能为空".into());
+    }
+    if !name_clean
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' || c.is_ascii())
+    {
+        return Err("技能名称只能包含字母、数字、- _ . 与空格".into());
+    }
+    let skill_path = dir.join(name_clean).join("SKILL.md");
+    if skill_path.exists() {
+        return Err(format!("技能已存在：{name_clean}"));
+    }
+    let desc = description.trim();
+    let mut md = String::new();
+    md.push_str("---\n");
+    md.push_str(&format!("name: {name_clean}\n"));
+    if !desc.is_empty() {
+        md.push_str(&format!("description: {desc}\n"));
+    }
+    md.push_str("---\n\n");
+    md.push_str(if content.trim().is_empty() {
+        "# 技能说明\n\n在这里写下技能的具体指令：告诉 AI 何时使用、如何一步步执行、有什么注意事项。\n"
+    } else {
+        content
+    });
+    std::fs::create_dir_all(skill_path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&skill_path, md).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(skill_path.to_string_lossy().to_string())
+}
+/// 扫描工作区与用户目录的可用技能（项目优先，去重）
+pub fn scan_skills(work_dir: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    collect_skills_from_dir(&std::path::Path::new(work_dir).join(PROJECT_SKILLS_DIR), &mut out);
+    if let Some(home) = dirs::home_dir() {
+        collect_skills_from_dir(&home.join(".canlow").join("skills"), &mut out);
+    }
+    // 去重（项目优先）
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|(n, _)| seen.insert(n.clone()));
+    out
+}
+
+/// 加载技能正文（项目优先，其次用户目录）
+fn load_skill(work_dir: &str, name: &str) -> Result<String, String> {
+    let name_clean = name.trim().trim_matches('/').to_string();
+    if name_clean.is_empty() {
+        return Err("缺少技能名称".into());
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let proj = std::path::Path::new(work_dir).join(PROJECT_SKILLS_DIR);
+    candidates.push(proj.join(&name_clean).join("SKILL.md"));
+    candidates.push(proj.join(format!("{name_clean}.md")));
+    if let Some(home) = dirs::home_dir() {
+        let user = home.join(".canlow").join("skills");
+        candidates.push(user.join(&name_clean).join("SKILL.md"));
+        candidates.push(user.join(format!("{name_clean}.md")));
+    }
+    for c in &candidates {
+        if let Ok(content) = std::fs::read_to_string(c) {
+            let (meta, body) = parse_frontmatter(&content);
+            let title = meta.get("name").cloned().unwrap_or_else(|| name_clean.clone());
+            let desc = meta.get("description").cloned().unwrap_or_default();
+            let mut out = format!("# 技能：{title}\n");
+            if !desc.is_empty() {
+                out.push_str(&format!("（{desc}）\n\n"));
+            }
+            out.push_str(&body);
+            // 上限 3 万字符，超出由 spill 机制落盘
+            return Ok(out.chars().take(30_000).collect());
+        }
+    }
+    Err(format!("技能不存在：{name_clean}（可用 skill 不带参数查看可用技能列表）"))
+}
+
+/// skill 工具：name 为空返回技能列表；否则加载技能正文
+fn tool_skill(work_dir: &str, args: &Value) -> Result<String, String> {
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if name.is_empty() {
+        let skills = scan_skills(work_dir);
+        if skills.is_empty() {
+            return Ok("（当前工作区与用户目录没有可用技能。技能文件放在 <工作区>/.canlow/skills/<名称>/SKILL.md 或 ~/.canlow/skills/<名称>/SKILL.md，文件头用 --- 标注 name 与 description）".into());
+        }
+        let lines: Vec<String> = skills
+            .iter()
+            .map(|(n, d)| if d.is_empty() { format!("- {n}") } else { format!("- {n}：{d}") })
+            .collect();
+        return Ok(format!("【可用技能】\n{}\n\n（加载技能内容用 skill 工具传对应名称）", lines.join("\n")));
+    }
+    load_skill(work_dir, name)
+}
+
 /// 任务图工具定义（工程模式相关）
 pub fn taskmap_tools() -> Value {
     plan_tool_definitions()
@@ -1392,7 +2213,7 @@ pub fn tool_definitions() -> Value {
         f("create_directory", "创建目录", file_args(None)),
         f("get_file_info", "查看文件信息", file_args(None)),
         f("delete_file", "删除文件或目录", file_args(None)),
-        f("search_files", "按文件名搜索", json!({
+        f("search_files", "按文件名搜索（★ 默认跳过 node_modules/.git/dist/target 等噪音目录；大目录遍历自动截断并提示）", json!({
             "type": "object",
             "properties": {
                 "pattern": str_param("文件名关键词"),
@@ -1401,17 +2222,18 @@ pub fn tool_definitions() -> Value {
             },
             "required": ["pattern"]
         })),
-        f("grep_search", "按内容搜索", json!({
+        f("grep_search", "按内容搜索（★ 默认跳过 node_modules/.git/dist/target 等噪音目录；超过 max_file_size 的大文件跳过并在结果尾部列出；大目录遍历自动截断并提示；如需搜噪音目录请把 path 直接指向其内部）", json!({
             "type": "object",
             "properties": {
                 "pattern": str_param("搜索关键词"),
                 "path": str_param("搜索目录"),
                 "max_matches": num_param("最大匹配数"),
-                "case_sensitive": json!({"type": "boolean"})
+                "case_sensitive": json!({"type": "boolean"}),
+                "max_file_size": num_param("跳过超过该 MB 数的文件（默认 1，即 >1MB 跳过；搜日志/大文件时调大，如 50）")
             },
             "required": ["pattern"]
         })),
-        f("glob_search", "glob 模式搜索", json!({
+        f("glob_search", "glob 模式搜索（★ 默认跳过 node_modules/.git/dist/target 等噪音目录；大目录遍历自动截断并提示）", json!({
             "type": "object",
             "properties": {
                 "pattern": str_param("如 **/*.py"),
@@ -1486,16 +2308,43 @@ pub fn tool_definitions() -> Value {
             "required": ["entry_id"]
         })),
         f("get_context_remaining", "查看当前上下文使用量与剩余空间", json!({"type": "object", "properties": {}})),
-        f("fetch_webpage", "抓取【已知 URL】的网页内容（标题+正文）；只能抓指定链接，不能搜索，搜索请用 search_web", json!({
+        f("fetch_webpage", "抓取【已知 URL】的网页内容（标题 + Markdown 正文，保留链接/列表/代码块/表格结构）；只能抓指定链接，不能搜索，搜索请用 search_web", json!({
             "type": "object",
             "properties": {"url": str_param("网页 URL")},
             "required": ["url"]
         })),
-        f("search_web", "★ 联网搜索（首选）：需要最新/实时信息时用这个，内置原生搜索引擎，返回带来源的结果；不要用 fetch_webpage 代替搜索", json!({
+        f("skill", "加载技能完整内容：传 name 加载对应技能（技能文件位于 <工作区>/.canlow/skills/<名称>/SKILL.md 或 ~/.canlow/skills/<名称>/SKILL.md，文件头用 --- 标注 name/description）；省略 name 返回当前可用技能列表", json!({
+            "type": "object",
+            "properties": {"name": str_param("技能名称（可选；省略返回技能列表）")}
+        })),
+        f("subagent", "委派一个自包含任务给子代理（独立上下文、共享工作区、看不到本对话历史）。prompt 必须完整自包含（包含全部背景与要求，子代理不能追问）；运行结束返回子代理的最终总结", json!({
+            "type": "object",
+            "properties": {
+                "description": str_param("3-5 字任务描述"),
+                "prompt": str_param("完整独立的任务提示词"),
+                "run_in_background": json!({"type": "boolean", "description": "true=后台运行（立即返回子代理 ID，之后用 subagent_report 获取结果、list_agents 查看状态、interrupt_agent 中断）；默认 false=前台等待完成"})
+            },
+            "required": ["description", "prompt"]
+        })),
+        f("subagent_report", "获取子代理运行结果（运行中返回当前状态，已完成返回最终总结）", json!({
+            "type": "object",
+            "properties": {"subagent_id": str_param("子代理 ID（subagent 返回或 list_agents 列出）")},
+            "required": ["subagent_id"]
+        })),
+        f("list_agents", "列出所有子代理及其状态（运行中/已完成/已中断、轮数）", json!({
+            "type": "object",
+            "properties": {}
+        })),
+        f("interrupt_agent", "请求中断一个正在运行的子代理", json!({
+            "type": "object",
+            "properties": {"agent_id": str_param("子代理 ID")},
+            "required": ["agent_id"]
+        })),
+        f("search_web", "★ 联网搜索（首选）：需要最新/实时信息时用这个，返回带来源的结果；同会话重复搜索会命中缓存（30 分钟内），如需最新结果请换更具体的关键词；不要用 fetch_webpage 代替搜索", json!({
             "type": "object",
             "properties": {
                 "query": str_param("搜索关键词，简洁明确"),
-                "max_results": num_param("最大结果数，默认 5")
+                "max_results": num_param("最大结果数，默认 5，最多 10")
             },
             "required": ["query"]
         })),
@@ -1619,6 +2468,84 @@ mod search_tests {
 mod scrape_tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn frontmatter_parses_name_and_description() {
+        let content = "---\nname: code-review\ndescription: 代码评审流程\n---\n\n# 正文\n步骤...";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(meta.get("name").map(|s| s.as_str()), Some("code-review"));
+        assert_eq!(meta.get("description").map(|s| s.as_str()), Some("代码评审流程"));
+        assert!(body.starts_with("# 正文"), "正文应去掉 frontmatter: {body}");
+    }
+
+    #[test]
+    fn frontmatter_without_header_keeps_whole_content() {
+        let content = "纯文本技能内容";
+        let (meta, body) = parse_frontmatter(content);
+        assert!(meta.is_empty());
+        assert_eq!(body, "纯文本技能内容");
+    }
+
+    #[test]
+    fn scan_and_load_skill_from_temp_dir() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("canlow-skill-test-{}", uuid::Uuid::new_v4()));
+        let skill_dir = dir.join(".canlow").join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let mut f = std::fs::File::create(skill_dir.join("SKILL.md")).unwrap();
+        writeln!(f, "---\nname: my-skill\ndescription: 测试技能\n---\n").unwrap();
+        writeln!(f, "# 我的技能\n第一步做 A。").unwrap();
+
+        let skills = scan_skills(dir.to_str().unwrap());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].0, "my-skill");
+        assert_eq!(skills[0].1, "测试技能");
+
+        let loaded = load_skill(dir.to_str().unwrap(), "my-skill").unwrap();
+        assert!(loaded.contains("# 技能：my-skill"), "加载应带标题: {loaded}");
+        assert!(loaded.contains("第一步做 A"), "正文应完整: {loaded}");
+        assert!(load_skill(dir.to_str().unwrap(), "nope").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn html_to_markdown_basic_structures() {
+        let html = concat!(
+            "<html><head><title>T</title><script>var x=1;</script></head><body>",
+            "<h1>标题</h1>",
+            "<p>一段文字带<a href=\"https://example.com\">链接</a>和<strong>加粗</strong>。</p>",
+            "<ul><li>第一项</li><li>第二项</li></ul>",
+            "<pre><code>let a = 1;</code></pre>",
+            "</body></html>"
+        );
+        let md = html_to_markdown(html);
+        assert!(md.contains("# 标题"), "标题应转为 h1: {md}");
+        assert!(md.contains("[链接](https://example.com)"), "链接应保留: {md}");
+        assert!(md.contains("**加粗**"), "加粗应保留: {md}");
+        assert!(md.contains("- 第一项"), "列表项应保留: {md}");
+        assert!(md.contains("```"), "代码块应有围栏: {md}");
+        assert!(!md.contains("var x=1"), "script 内容应丢弃: {md}");
+        assert!(!md.contains("<p>"), "不应残留 HTML 标签: {md}");
+    }
+
+    #[test]
+    fn html_to_markdown_table() {
+        let html = "<table><thead><tr><th>名称</th><th>版本</th></tr></thead>
+            <tbody><tr><td>Rust</td><td>1.97</td></tr></tbody></table>";
+        let md = html_to_markdown(html);
+        assert!(md.contains("| 名称 | 版本 |"), "表头行: {md}");
+        assert!(md.contains("| --- | --- |"), "分隔行: {md}");
+        assert!(md.contains("| Rust | 1.97 |"), "数据行: {md}");
+    }
+
+    #[test]
+    fn detect_date_formats() {
+        assert_eq!(detect_date("发布于 2024-05-12 的文章"), Some("2024-05-12".into()));
+        assert_eq!(detect_date("2024年5月12日更新"), Some("2024年5月12日".into()));
+        assert_eq!(detect_date("2024/5/2 发表"), Some("2024-05-02".into()));
+        assert_eq!(detect_date("没有任何日期"), None);
+        assert_eq!(detect_date("版本号 3.1.2 发布"), None, "不应误判版本号");
+    }
 
     #[test]
     fn bing_jump_url_decodes() {
